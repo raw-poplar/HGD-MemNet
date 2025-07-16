@@ -5,9 +5,8 @@ from torch.utils.data import DataLoader
 import json
 import os
 import glob
-import re
-from torch.amp import GradScaler
 from tqdm import tqdm
+from torch.amp import GradScaler
 
 import config
 from .model import HGD_MemNet
@@ -16,51 +15,68 @@ from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
 # 设置设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-@torch.jit.script
-def train_batch_stepwise_jitted(x_ref_padded, steps_data, model: HGD_MemNet):
+def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
+    """
+    按照描述进行训练：在每个“思考步骤”中都进行一次损失计算和反向传播，
+    并动态调整学习率。
+    """
+    model.train()
+    x_ref_padded = x_ref_padded.to(DEVICE)
+    
     batch_size = x_ref_padded.size(0)
-    total_batch_loss = torch.tensor(0.0, device=x_ref_padded.device)
-    h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=x_ref_padded.device)
+    total_batch_loss = 0.0
+    steps_updated = 0
+    
+    h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+    
+    original_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
     
     for t in range(len(steps_data)):
         x_t_padded, target_padded, gate_target = steps_data[t]
+        x_t_padded = x_t_padded.to(DEVICE) if x_t_padded is not None else None
+        gate_target = gate_target.to(DEVICE)
+        if target_padded is not None:
+            target_padded = target_padded.to(DEVICE)
+
+        # 1. 在每个时间步内部动态调整学习率
+        for i, param_group in enumerate(optimizer.param_groups):
+            param_group['lr'] = original_lrs[i] * (config.INNER_STEP_LR_DECAY ** t)
+
+        optimizer.zero_grad()
         
-        with torch.cuda.amp.autocast(enabled=True):
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev.detach())
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev)
             
             gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
             step_loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target)
             
             if target_padded is not None:
-                output_loss = torch.tensor(0.0, device=x_ref_padded.device)
-                seq_len = target_padded.size(1)
-                for i in range(seq_len):
-                    token_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
-                        output_logits, target_padded[:, i]
-                    )
-                    output_loss += token_loss
-                if seq_len > 0:
-                    step_loss += output_loss / float(seq_len)
+                output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
+                    output_logits.view(-1, config.VOCAB_SIZE), 
+                    target_padded.view(-1)
+                )
+                if not torch.isnan(output_loss):
+                    step_loss += output_loss
         
-        total_batch_loss += step_loss
-        h_prev = h_next
-        
-    return total_batch_loss
+        # 2. 立即进行反向传播和参数更新
+        scaler.scale(step_loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-def train_batch_stepwise(x_ref_padded, steps_data, model):
-    x_ref_padded = x_ref_padded.to(DEVICE)
-    steps_data_device = []
-    for x_t, y_t, g_t in steps_data:
-        steps_data_device.append((
-            x_t.to(DEVICE),
-            y_t.to(DEVICE) if y_t is not None else None,
-            g_t.to(DEVICE)
-        ))
-    return train_batch_stepwise_jitted(x_ref_padded, steps_data_device, model)
+        total_batch_loss += step_loss.item()
+        h_prev = h_next.detach()
+        steps_updated += 1
+        
+    for i, param_group in enumerate(optimizer.param_groups):
+        param_group['lr'] = original_lrs[i]
+        
+    return total_batch_loss, steps_updated
 
 def validate_model(model):
+    """验证模型，只计算损失。"""
     model.eval()
-    # 验证数据现在也是一个目录
     val_data_path = os.path.join(config.LCCC_PROCESSED_PATH, "valid")
     if not os.path.exists(val_data_path):
         print("警告：找不到二进制验证数据目录 valid/，跳过验证。")
@@ -74,25 +90,46 @@ def validate_model(model):
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.BATCH_SIZE // config.GRADIENT_ACCUMULATION_STEPS,
+        batch_size=config.BATCH_SIZE,
         collate_fn=binary_collate_fn,
         num_workers=min(os.cpu_count(), 4),
         shuffle=False
     )
 
     total_val_loss = 0
+    total_steps = 0
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="正在验证")
         for x_ref_padded, steps_data in pbar:
-            batch_loss = train_batch_stepwise(x_ref_padded, steps_data, model)
-            total_val_loss += batch_loss.item()
-            pbar.set_postfix({"验证损失": f"{batch_loss.item():.4f}"})
-    
-    avg_val_loss = total_val_loss / len(val_loader) if val_loader else 0
+            x_ref_padded = x_ref_padded.to(DEVICE)
+            h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+            
+            for x_t, y_t, g_t in steps_data:
+                x_t = x_t.to(DEVICE) if x_t is not None else None
+                y_t = y_t.to(DEVICE) if y_t is not None else None
+                g_t = g_t.to(DEVICE)
+
+                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev)
+                gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
+                step_loss = nn.BCEWithLogitsLoss()(gate_pred_logits, g_t)
+                
+                if y_t is not None:
+                    output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
+                        output_logits.view(-1, config.VOCAB_SIZE), 
+                        y_t.view(-1)
+                    )
+                    if not torch.isnan(output_loss):
+                        step_loss += output_loss
+                
+                total_val_loss += step_loss.item()
+                h_prev = h_next
+                total_steps += 1
+
+    avg_val_loss = total_val_loss / total_steps if total_steps > 0 else 0
     model.train()
     return avg_val_loss
 
-def save_checkpoint(model, optimizer, scaler, epoch, steps, batches_in_epoch, directory, is_best=False):
+def save_checkpoint(model, optimizer, scaler, epoch, steps, directory, is_best=False):
     if not os.path.exists(directory): os.makedirs(directory)
     filename = f"checkpoint_epoch_{epoch}_steps_{steps}.pth"
     filepath = os.path.join(directory, filename)
@@ -104,7 +141,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, steps, batches_in_epoch, di
 
     model_state = model.state_dict()
     torch.save({
-        'epoch': epoch, 'total_steps': steps, 'batches_in_epoch': batches_in_epoch,
+        'epoch': epoch, 'total_steps': steps,
         'model_state_dict': model_state, 'optimizer_state_dict': optimizer.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
     }, filepath)
@@ -117,9 +154,9 @@ def save_checkpoint(model, optimizer, scaler, epoch, steps, batches_in_epoch, di
         print(f"*** 新的最佳模型已保存至 {best_filepath} ***")
 
 def load_latest_checkpoint(model, optimizer, scaler, directory):
-    if not os.path.exists(directory): return 0, 0, 0
+    if not os.path.exists(directory): return 0, 0
     checkpoints = glob.glob(os.path.join(directory, "checkpoint_*.pth"))
-    if not checkpoints: return 0, 0, 0
+    if not checkpoints: return 0, 0
 
     latest_checkpoint_path = max(checkpoints, key=os.path.getmtime)
     print(f"正在从最新的检查点加载: {latest_checkpoint_path}")
@@ -131,10 +168,9 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
     
     start_epoch = checkpoint.get('epoch', 0)
     total_steps = checkpoint.get('total_steps', 0)
-    batches_in_epoch = checkpoint.get('batches_in_epoch', 0)
     
     print(f"已从 '{latest_checkpoint_path}' 加载 (轮次 {start_epoch}, 总步数 {total_steps})。")
-    return start_epoch, total_steps, batches_in_epoch
+    return start_epoch, total_steps
 
 def train_model():
     print("开始训练流程...")
@@ -148,77 +184,54 @@ def train_model():
 
     model = HGD_MemNet(
         vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
-        context_dim=config.CONTEXT_VECTOR_DIM, dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
+        dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
         static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
     ).to(DEVICE)
     
-    try:
-        model = torch.jit.script(model)
-        print("模型已成功JIT脚本化，以提升性能。")
-    except Exception as e:
-        print(f"警告：模型JIT脚本化失败: {e}")
+    print("注意：由于动态学习率调整，模型JIT脚本化已被禁用。")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scaler = GradScaler(enabled=torch.cuda.is_available())
 
-    start_epoch, total_steps, batches_to_skip = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
+    start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
 
-    # 训练数据现在是一个目录
     train_data_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
-    try:
-        # 创建一个临时数据集仅用于获取总长度
-        train_len_dataset = BinaryDialogueDataset(train_data_dir)
-        steps_per_epoch = len(train_len_dataset) // (config.BATCH_SIZE // config.GRADIENT_ACCUMULATION_STEPS)
-        del train_len_dataset
-    except FileNotFoundError:
-        steps_per_epoch = 0
-
-    optimizer.zero_grad()
+    
     best_val_loss = float('inf')
 
     for epoch in range(start_epoch, config.NUM_EPOCHS):
-        # 每次 epoch 都重新创建数据集对象，以支持 shuffle
         train_dataset = BinaryDialogueDataset(train_data_dir)
+        # 注意：不再需要除以梯度累积步数
         train_loader = DataLoader(
-            train_dataset, batch_size=config.BATCH_SIZE // config.GRADIENT_ACCUMULATION_STEPS,
+            train_dataset, batch_size=config.BATCH_SIZE,
             collate_fn=binary_collate_fn, num_workers=min(os.cpu_count(), 4),
             pin_memory=True, shuffle=True
         )
 
-        pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}", total=steps_per_epoch)
+        pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
         
-        for batch_idx, (x_ref_padded, steps_data) in enumerate(pbar):
-            if epoch == start_epoch and batch_idx < batches_to_skip:
-                continue
-
-            batch_loss = train_batch_stepwise(x_ref_padded, steps_data, model)
-            scaler.scale(batch_loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+        for x_ref_padded, steps_data in pbar:
+            batch_loss, steps_in_batch = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
             
-            if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-                total_steps += 1
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                pbar.set_postfix({"训练损失": f"{batch_loss.item():.4f}", "总步数": total_steps})
+            total_steps += steps_in_batch
+            avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
+            pbar.set_postfix({"平均步损失": f"{avg_loss:.4f}", "总更新步数": total_steps})
 
-                if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
-                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, batch_idx + 1, config.CHECKPOINT_DIR)
-                
-                if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
-                    val_loss = validate_model(model)
-                    print(f"\n--- 验证 (步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        print("发现新的最佳模型！正在保存...")
-                        save_checkpoint(model, optimizer, scaler, epoch, total_steps, batch_idx + 1, config.CHECKPOINT_DIR, is_best=True)
+            if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+                save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+            
+            if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
+                val_loss = validate_model(model)
+                print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    print("发现新的最佳模型！正在保存...")
+                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
 
         print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
     print("\n训练全部完成！")
 
 if __name__ == "__main__":
-    # 检查训练数据目录是否存在
     train_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
     if not os.path.isdir(train_dir):
         print(f"错误: 未找到处理后的二进制数据目录 '{train_dir}'。")
