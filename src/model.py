@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 import config
 
-# --- 注意力模块 ---
+# --- 注意力模块 (无变化) ---
 class Attention(nn.Module):
     """
     标准的 Bahdanau 注意力机制
@@ -41,23 +41,49 @@ class Attention(nn.Module):
         return context, attn_weights
 
 
+# --- 新: 可训练的“蓄水池”式RNN单元 ---
+class ReservoirRNNCell(nn.Module):
+    """
+    一个简单的可训练RNN单元，用于模拟“两两相连”的神经元动态。
+    这取代了原版的GRU单元。
+    """
+    def __init__(self, input_size, hidden_size):
+        super(ReservoirRNNCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.W_ih = nn.Linear(input_size, hidden_size, bias=True)
+        self.W_hh = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x_t, h_prev):
+        """
+        Args:
+            x_t (torch.Tensor): 当前时间步的输入, shape: (batch_size, input_size)
+            h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch_size, hidden_size)
+        Returns:
+            h_next (torch.Tensor): 当前步的输出隐藏状态, shape: (batch_size, hidden_size)
+        """
+        h_next = torch.tanh(self.W_ih(x_t) + self.W_hh(h_prev))
+        return h_next
+
+
 # --- 动态神经组 (核心演化模块) ---
 class DynamicGroup(nn.Module):
     """
-    模型的核心，一个动态演化的神经组，现在加入了注意力机制
+    模型的核心，一个动态演化的神经组。
+    核心RNN被替换为ReservoirRNNCell以匹配描述。
     """
     def __init__(self, embed_dim, hidden_dim):
         super(DynamicGroup, self).__init__()
         self.hidden_dim = hidden_dim
         
-        # 编码器: 用于处理参照输入 x_ref
+        # 编码器: 用于处理参照输入 x_ref (保持不变)
         self.encoder_rnn = nn.GRU(embed_dim, hidden_dim, batch_first=True)
         
-        # 注意力模块
+        # 注意力模块 (保持不变)
         self.attention = Attention(hidden_dim)
 
-        # 核心演化RNN: 输入维度现在是 embed_dim (x_t) + hidden_dim (attention_context)
-        self.core_rnn = nn.GRU(embed_dim + hidden_dim, hidden_dim, batch_first=True)
+        # 核心演化RNN: 被替换为新的可训练“蓄水池”单元
+        self.core_rnn = ReservoirRNNCell(embed_dim + hidden_dim, hidden_dim)
 
     def forward(self, x_t, x_ref_encoded, h_prev):
         """
@@ -90,76 +116,97 @@ class DynamicGroup(nn.Module):
         rnn_input = torch.cat((x_t_input, attn_context.unsqueeze(1)), dim=2)
 
         # 3. 将拼接后的向量输入到核心RNN
-        # h_prev shape: (1, batch_size, hidden_dim) for GRU
-        _, h_next = self.core_rnn(rnn_input, h_prev.unsqueeze(0))
+        # h_prev shape: (batch_size, hidden_dim) for our cell
+        # rnn_input is squeezed to (batch_size, embed_dim + hidden_dim)
+        h_next = self.core_rnn(rnn_input.squeeze(1), h_prev)
 
-        return h_next.squeeze(0), attn_context
+        return h_next, attn_context
 
 
 # --- 静态网络对 (决策模块) ---
 class StaticHead(nn.Module):
     """
     静态网络对 (决策前端)
-    包含一个门控网络和一个输出网络。
+    根据描述重构：从动态组的输出中进行固定和随机采样。
     """
-    def __init__(self, hidden_dim, sampler_dim, input_dim, output_dim):
+    def __init__(self, hidden_dim, sampler_input_dim, context_input_dim, output_dim, fixed_ratio, random_ratio):
         super(StaticHead, self).__init__()
         self.hidden_dim = hidden_dim
-        self.sampler_dim = sampler_dim # 从动态组采样得到的维度
-        self.input_dim = input_dim # 原始外部输入的维度
-        self.output_dim = output_dim # 输出维度，即词汇表大小
+        self.output_dim = output_dim
 
-        # 两个网络接收的输入是拼接后的向量
-        concatenated_dim = sampler_dim + input_dim
+        # 计算采样数量
+        self.num_fixed = int(sampler_input_dim * fixed_ratio)
+        self.num_random = int(sampler_input_dim * random_ratio)
+        self.sampler_output_dim = self.num_fixed + self.num_random
+        
+        # 确定用于随机采样的神经元池的维度
+        self.random_pool_dim = sampler_input_dim - self.num_fixed
+        if self.random_pool_dim < self.num_random:
+            raise ValueError("Random sampling pool is smaller than the number of items to sample.")
+
+        # 拼接后的维度：采样状态 + 注意力上下文
+        concatenated_dim = self.sampler_output_dim + context_input_dim
 
         # 1. 门控网络
-        # MLP: Linear -> ReLU -> Linear -> Sigmoid
         self.gate_network = nn.Sequential(
             nn.Linear(concatenated_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid() # 输出一个0~1之间的值作为门控信号
+            nn.Sigmoid()
         )
 
         # 2. 输出网络
-        # MLP: Linear -> ReLU -> Linear
         self.output_network = nn.Sequential(
             nn.Linear(concatenated_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim) # 输出词汇表大小的logits
+            nn.Linear(hidden_dim, output_dim)
         )
 
-    def forward(self, sampled_state, x_ref):
+    def forward(self, h_from_dynamic, attn_context):
         """
-        :param sampled_state: 从动态组采样得到的内部状态 (batch_size, sampler_dim)
-        :param x_ref: 原始的外部输入，作为参照 (batch_size, input_dim)
+        :param h_from_dynamic: 从动态组输出的完整隐藏状态 (batch_size, sampler_input_dim)
+        :param attn_context: 从注意力机制输出的上下文向量 (batch_size, context_input_dim)
         :return: gate_signal (batch_size, 1), output_logits (batch_size, output_dim)
         """
-        # 将采样状态和参照输入拼接起来
-        combined_input = torch.cat((sampled_state, x_ref), dim=1)
+        # 1. 固定采样 (从前N个神经元)
+        fixed_sample = h_from_dynamic[:, :self.num_fixed]
+
+        # 2. 随机采样 (从剩余的神经元池中)
+        random_pool = h_from_dynamic[:, self.num_fixed:]
+        # 为整个批次生成一套随机索引
+        rand_indices = torch.randperm(self.random_pool_dim, device=h_from_dynamic.device)[:self.num_random]
+        random_sample = random_pool[:, rand_indices]
+
+        # 3. 拼接采样结果
+        sampled_state = torch.cat((fixed_sample, random_sample), dim=1)
+        
+        # 4. 将采样状态和注意力上下文拼接起来
+        combined_input = torch.cat((sampled_state, attn_context), dim=1)
 
         gate_signal = self.gate_network(combined_input)
         output_logits = self.output_network(combined_input)
 
         return gate_signal, output_logits
 
+
 class HGD_MemNet(nn.Module):
     """
     分层门控动态记忆网络 (Hierarchical Gated-Dynamic Memory Network)
     整合了所有模块
     """
-    def __init__(self, vocab_size, embed_dim, context_dim, dynamic_hidden_dim, static_hidden_dim):
+    def __init__(self, vocab_size, embed_dim, dynamic_hidden_dim, static_hidden_dim):
         super(HGD_MemNet, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         
-        # 动态组现在需要 embed_dim 和 dynamic_hidden_dim
         self.dynamic_group = DynamicGroup(embed_dim, dynamic_hidden_dim)
         
         self.static_head = StaticHead(
-            hidden_dim=static_hidden_dim,   # 静态网络内部维度
-            sampler_dim=dynamic_hidden_dim,  # 来自DynamicGroup的输出 (h_next)
-            input_dim=dynamic_hidden_dim,    # 参照输入的上下文 (attn_context)
-            output_dim=vocab_size
+            hidden_dim=static_hidden_dim,
+            sampler_input_dim=dynamic_hidden_dim,  # 从DynamicGroup的完整输出中采样
+            context_input_dim=dynamic_hidden_dim,  # 注意力上下文的维度
+            output_dim=vocab_size,
+            fixed_ratio=config.FIXED_SAMPLING_RATIO,
+            random_ratio=config.RANDOM_SAMPLING_RATIO
         )
 
     def forward(self, x_t, x_ref, h_prev):
@@ -198,41 +245,48 @@ class HGD_MemNet(nn.Module):
 # 这是一个简单的测试，确保我们的类能正常工作
 if __name__ == '__main__':
     # --- 测试 DynamicGroup (已有代码) ---
-    print("--- 测试 DynamicGroup ---")
-    batch_size = config.BATCH_SIZE
+    print("--- 测试 DynamicGroup (新版) ---")
+    batch_size = 4  # 使用较小的批处理大小进行测试
     input_dim = config.EMBEDDING_DIM
-    context_dim = config.CONTEXT_VECTOR_DIM
     hidden_dim = config.DYNAMIC_GROUP_HIDDEN_DIM
 
     dynamic_group = DynamicGroup(input_dim, hidden_dim)
-    x_t = torch.randn(batch_size, 1, input_dim) # 修改为 (batch_size, 1, input_dim)
-    x_ref_encoded = torch.randn(batch_size, 10, hidden_dim) # 假设一个较长的序列
+    x_t_embed = torch.randn(batch_size, 1, input_dim) 
+    x_ref_encoded = torch.randn(batch_size, 10, hidden_dim)
     h_prev = torch.randn(batch_size, hidden_dim)
-    h_next, attn_context = dynamic_group(x_t, x_ref_encoded, h_prev)
+    
+    h_next, attn_context = dynamic_group(x_t_embed, x_ref_encoded, h_prev)
     print(f"输出 h_next 的形状: {h_next.shape}")
     print(f"输出 attn_context 的形状: {attn_context.shape}\n")
     assert h_next.shape == (batch_size, hidden_dim)
-    
+    assert attn_context.shape == (batch_size, hidden_dim)
+    print("DynamicGroup 维度检查通过！\n")
+
     # --- 测试 StaticHead ---
-    print("--- 测试 StaticHead ---")
-    sampler_dim = hidden_dim # 在新版中，采样维度就是隐藏层维度
+    print("--- 测试 StaticHead (新版采样) ---")
     output_dim = config.VOCAB_SIZE
     static_head_hidden_dim = config.STATIC_HEAD_HIDDEN_DIM
     
-    # 注意：这里的input_dim现在是注意力上下文的维度，也等于hidden_dim
-    static_head = StaticHead(static_head_hidden_dim, sampler_dim, hidden_dim, output_dim)
+    static_head = StaticHead(
+        hidden_dim=static_head_hidden_dim,
+        sampler_input_dim=hidden_dim,
+        context_input_dim=hidden_dim,
+        output_dim=output_dim,
+        fixed_ratio=config.FIXED_SAMPLING_RATIO,
+        random_ratio=config.RANDOM_SAMPLING_RATIO
+    )
     print("静态决策头 (StaticHead) 已实例化:")
     print(static_head)
 
     # 创建虚拟的采样状态和参照输入
-    sampled_state = torch.randn(batch_size, sampler_dim)
-    x_ref = torch.randn(batch_size, hidden_dim) # x_ref现在是attn_context
+    h_from_dynamic_test = torch.randn(batch_size, hidden_dim)
+    attn_context_test = torch.randn(batch_size, hidden_dim)
 
-    print(f"\n输入 sampled_state 的形状: {sampled_state.shape}")
-    print(f"输入 x_ref (attn_context) 的形状: {x_ref.shape}")
+    print(f"\n输入 h_from_dynamic 的形状: {h_from_dynamic_test.shape}")
+    print(f"输入 attn_context 的形状: {attn_context_test.shape}")
 
     # 执行一次前向传播
-    gate_signal, output_logits = static_head(sampled_state, x_ref)
+    gate_signal, output_logits = static_head(h_from_dynamic_test, attn_context_test)
 
     print(f"\n输出 gate_signal 的形状: {gate_signal.shape}")
     print(f"输出 output_logits 的形状: {output_logits.shape}")
@@ -240,23 +294,21 @@ if __name__ == '__main__':
     # 验证输出维度是否正确
     assert gate_signal.shape == (batch_size, 1)
     assert output_logits.shape == (batch_size, output_dim)
-    print("\n维度检查通过！") 
+    print("\nStaticHead 维度检查通过！\n")
     
     # --- 测试 HGD_MemNet ---
-    print("\n--- 测试 HGD_MemNet (完整模型) ---")
+    print("\n--- 测试 HGD_MemNet (完整模型, 新版) ---")
     model = HGD_MemNet(
         vocab_size=config.VOCAB_SIZE,
         embed_dim=config.EMBEDDING_DIM,
-        context_dim=config.CONTEXT_VECTOR_DIM,
         dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
         static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
     ).to("cpu")
     
     print("\n模型已实例化:")
-    print(model)
+    # print(model) # 模型结构较大，可以选择不打印
 
     # 准备虚拟输入
-    # (batch, seq_len)
     x_t_test = torch.randint(0, config.VOCAB_SIZE, (batch_size, 5)) 
     x_ref_test = torch.randint(0, config.VOCAB_SIZE, (batch_size, 15))
     h_prev_test = torch.randn(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM)
