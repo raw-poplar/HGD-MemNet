@@ -156,3 +156,8 @@ cython_debug/
 
 # macOS specific
 .DS_Store 
+
+# 忽略检查点和数据目录
+checkpoints/
+processed_data/
+logs/ 

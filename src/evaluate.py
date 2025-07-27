@@ -12,6 +12,18 @@ from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
 from .train import DEVICE # 从训练脚本中导入设备设置
 from functools import partial
 
+import os
+import torch
+from torch.utils.data import DataLoader
+import config
+from .dataset import BinaryDialogueDataset, binary_collate_fn
+from .utils import load_model_from_checkpoint, compute_loss
+import nltk
+from nltk.translate.bleu_score import sentence_bleu
+from math import exp
+
+nltk.download('punkt')
+
 # --- JIT 编译优化 ---
 # 同样将贪心解码的核心逻辑进行JIT编译，以提升评估速度
 @torch.jit.script

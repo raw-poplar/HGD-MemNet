@@ -8,6 +8,8 @@ import os
 import config # 导入全局配置
 from tqdm import tqdm
 import glob # 导入 glob 模块用于查找文件
+import random
+import psutil  # 新增：内存监控
 
 
 class Vocabulary:

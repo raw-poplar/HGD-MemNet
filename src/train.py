@@ -8,9 +8,18 @@ import glob
 from tqdm import tqdm
 from torch.amp import GradScaler
 
+# 新增：性能优化
+import torch.backends.cudnn as cudnn
+cudnn.benchmark = True  # 启用 cudnn 基准测试以加速
+
 import config
 from .model import HGD_MemNet
 from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
+from .utils import load_model_from_checkpoint, compute_loss  # 新增：导入工具函数
+import logging  # 新增：日志记录
+
+# 设置日志
+logging.basicConfig(filename='train.log', level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 # 设置设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,6 +40,10 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     
     original_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
     
+    # 新增：温度退火参数 (从config导入)
+    initial_temperature = config.INITIAL_TEMPERATURE
+    temperature_decay = config.TEMPERATURE_DECAY
+
     for t in range(len(steps_data)):
         x_t_padded, target_padded, gate_target = steps_data[t]
         x_t_padded = x_t_padded.to(DEVICE) if x_t_padded is not None else None
@@ -42,22 +55,17 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         for i, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = original_lrs[i] * (config.INNER_STEP_LR_DECAY ** t)
 
+        # 新增：计算当前步骤的温度
+        current_temperature = max(initial_temperature * (temperature_decay ** t), config.MIN_TEMPERATURE)
+
         optimizer.zero_grad()
         
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev)
+            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature)  # 更新：传入温度
             
-            gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
-            step_loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target)
+            # 使用 utils 中的 compute_loss
+            step_loss = compute_loss(gate_pred, gate_target, output_logits, target_padded)
             
-            if target_padded is not None:
-                output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
-                    output_logits.view(-1, config.VOCAB_SIZE), 
-                    target_padded.view(-1)
-                )
-                if not torch.isnan(output_loss):
-                    step_loss += output_loss
-        
         # 2. 立即进行反向传播和参数更新
         scaler.scale(step_loss).backward()
         scaler.unscale_(optimizer)
@@ -92,7 +100,7 @@ def validate_model(model):
         val_dataset,
         batch_size=config.BATCH_SIZE,
         collate_fn=binary_collate_fn,
-        num_workers=min(os.cpu_count(), 4),
+        num_workers=min(os.cpu_count(), 2),  # 同样限制为2
         shuffle=False
     )
 
@@ -109,17 +117,13 @@ def validate_model(model):
                 y_t = y_t.to(DEVICE) if y_t is not None else None
                 g_t = g_t.to(DEVICE)
 
-                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev)
-                gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
-                step_loss = nn.BCEWithLogitsLoss()(gate_pred_logits, g_t)
+                # 新增：在验证时使用硬采样和低温
+                model.dynamic_group.core_rnn.use_hard_sampling = True  # 切换到硬采样
+                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温
+                model.dynamic_group.core_rnn.use_hard_sampling = False  # 恢复
                 
-                if y_t is not None:
-                    output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
-                        output_logits.view(-1, config.VOCAB_SIZE), 
-                        y_t.view(-1)
-                    )
-                    if not torch.isnan(output_loss):
-                        step_loss += output_loss
+                # 使用 utils 中的 compute_loss
+                step_loss = compute_loss(gate_pred, g_t, output_logits, y_t)
                 
                 total_val_loss += step_loss.item()
                 h_prev = h_next
@@ -154,6 +158,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, steps, directory, is_best=F
         print(f"*** 新的最佳模型已保存至 {best_filepath} ***")
 
 def load_latest_checkpoint(model, optimizer, scaler, directory):
+    # 替换为 utils 中的函数，但保留 optimizer 和 scaler 加载
     if not os.path.exists(directory): return 0, 0
     checkpoints = glob.glob(os.path.join(directory, "checkpoint_*.pth"))
     if not checkpoints: return 0, 0
@@ -173,63 +178,83 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
     return start_epoch, total_steps
 
 def train_model():
-    print("开始训练流程...")
-    vocab_path = os.path.join(config.LCCC_PROCESSED_PATH, "vocabulary.json")
-    with open(vocab_path, 'r', encoding='utf-8') as f:
-        vocab_dict = json.load(f)
-    vocab = Vocabulary("lccc")
-    vocab.__dict__.update(vocab_dict)
-    config.VOCAB_SIZE = vocab.num_words
-    print(f"词汇表加载完毕。大小: {vocab.num_words}")
+    try:
+        print("开始训练流程...")
+        logging.info("开始训练")
 
-    model = HGD_MemNet(
-        vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
-        dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
-        static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
-    ).to(DEVICE)
-    
-    print("注意：由于动态学习率调整，模型JIT脚本化已被禁用。")
+        vocab_path = os.path.join(config.LCCC_PROCESSED_PATH, "vocabulary.json")
+        with open(vocab_path, 'r', encoding='utf-8') as f:
+            vocab_dict = json.load(f)
+        vocab = Vocabulary("lccc")
+        vocab.__dict__.update(vocab_dict)
+        config.VOCAB_SIZE = vocab.num_words
+        print(f"词汇表加载完毕。大小: {vocab.num_words}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    scaler = GradScaler(enabled=torch.cuda.is_available())
+        # 新增：启用 TF32 以加速（Ampere+ GPU）
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
 
-    start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
-
-    train_data_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
-    
-    best_val_loss = float('inf')
-
-    for epoch in range(start_epoch, config.NUM_EPOCHS):
-        train_dataset = BinaryDialogueDataset(train_data_dir)
-        # 注意：不再需要除以梯度累积步数
-        train_loader = DataLoader(
-            train_dataset, batch_size=config.BATCH_SIZE,
-            collate_fn=binary_collate_fn, num_workers=min(os.cpu_count(), 4),
-            pin_memory=True, shuffle=True
-        )
-
-        pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
+        model = HGD_MemNet(
+            vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
+            dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
+            static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
+        ).to(DEVICE)
         
-        for x_ref_padded, steps_data in pbar:
-            batch_loss, steps_in_batch = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
-            
-            total_steps += steps_in_batch
-            avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
-            pbar.set_postfix({"平均步损失": f"{avg_loss:.4f}", "总更新步数": total_steps})
+        # 新增：训练时设置软采样
+        model.dynamic_group.core_rnn.use_hard_sampling = False
 
-            if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
-                save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
-            
-            if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
-                val_loss = validate_model(model)
-                print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    print("发现新的最佳模型！正在保存...")
-                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
+        print("注意：由于动态学习率调整，模型JIT脚本化已被禁用。")
 
-        print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
-    print("\n训练全部完成！")
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-5)  # 新增：L2正则
+        scaler = GradScaler(enabled=torch.cuda.is_available())
+
+        start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
+
+        train_data_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
+        
+        best_val_loss = float('inf')
+
+        # 新增：全局学习率调度器
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)  # 每轮衰减
+
+        for epoch in range(start_epoch, config.NUM_EPOCHS):
+            train_dataset = BinaryDialogueDataset(train_data_dir)
+            # 注意：不再需要除以梯度累积步数
+            train_loader = DataLoader(
+                train_dataset, batch_size=config.BATCH_SIZE,
+                collate_fn=binary_collate_fn, num_workers=min(os.cpu_count(), 2),  # 限制为2以降低内存使用
+                pin_memory=True, shuffle=True
+            )
+
+            pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
+            
+            for x_ref_padded, steps_data in pbar:
+                batch_loss, steps_in_batch = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
+                
+                total_steps += steps_in_batch
+                avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
+                pbar.set_postfix({"平均步损失": f"{avg_loss:.4f}", "总更新步数": total_steps})
+
+                if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                
+                if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
+                    val_loss = validate_model(model)
+                    print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        print("发现新的最佳模型！正在保存...")
+                        logging.info(f"新最佳验证损失: {val_loss}")
+                        save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
+
+            scheduler.step()  # 每轮更新学习率
+
+            print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
+        print("\n训练全部完成！")
+        logging.info("训练完成")
+    except Exception as e:
+        logging.error(f"训练出错: {e}")
+        raise
 
 if __name__ == "__main__":
     train_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")

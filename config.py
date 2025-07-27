@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 
+import os
+
 # ------------------------------------
 # 模型维度和结构相关的超参数
 # ------------------------------------
 # --- 内存与性能关键参数 ---
-# 词汇表大小 (由预处理脚本生成，此为占位符)
+# 词汇表大小 (由预处理脚本生成，此为占位符) - 实际值基于数据集词汇
 VOCAB_SIZE = 5000
-# 词嵌入维度 (影响模型大小和内存)
-EMBEDDING_DIM = 128
-# 动态神经组隐藏层维度 (影响模型大小和内存)
-DYNAMIC_GROUP_HIDDEN_DIM = 256
-# 静态网络隐藏层维度 (影响模型大小和内存)
-STATIC_HEAD_HIDDEN_DIM = 128
+# 词嵌入维度 (影响模型大小和内存) - 为4G显存调低，建议64-128以平衡性能
+EMBEDDING_DIM = 96
+# 动态神经组隐藏层维度 (影响模型大小和内存) - 为4G显存调低，建议128-256
+DYNAMIC_GROUP_HIDDEN_DIM = 192
+# 静态网络隐藏层维度 (影响模型大小和内存) - 为4G显存调低，建议64-128
+STATIC_HEAD_HIDDEN_DIM = 96
 
 
 # --- 其他模型参数 ---
@@ -35,11 +37,17 @@ UNK_token = 3  # 未知词
 # 训练过程相关的超参数
 # ------------------------------------
 # --- 内存与性能关键参数 ---
-# 逻辑批处理大小。实际GPU处理的大小会是 BATCH_SIZE / GRADIENT_ACCUMULATION_STEPS。
-BATCH_SIZE = 12
-# 梯度累积步骤。用于在不增加内存消耗的情况下模拟更大的批次。
-# 例如，BATCH_SIZE=32, ACCUMULATION_STEPS=4, 则GPU每次处理8个样本，累积4次后更新一次权重。
-GRADIENT_ACCUMULATION_STEPS = 4
+# 逻辑批处理大小。实际GPU处理的大小会是 BATCH_SIZE / GRADIENT_ACCUMULATION_STEPS。 - 为4G显存调低
+BATCH_SIZE = 4
+# 梯度累积步骤。用于在不增加内存消耗的情况下模拟更大的批次。 - 相应调高以维持等效批次大小
+# 例如，BATCH_SIZE=4, ACCUMULATION_STEPS=12, 等效批次大小为 48
+GRADIENT_ACCUMULATION_STEPS = 12
+
+# 新增：低内存模式标志
+LOW_MEMORY_MODE = True  # 如果为True，进一步减小批次大小以适应低端GPU
+if LOW_MEMORY_MODE:
+    BATCH_SIZE = 2
+    GRADIENT_ACCUMULATION_STEPS = 24  # 保持等效批次大小
 
 
 # --- 其他训练参数 ---
@@ -51,6 +59,13 @@ LEARNING_RATE = 0.001
 LR_DECAY_RATE = 0.95
 # 训练轮次
 NUM_EPOCHS = 20
+# [新增] 内部思考步骤的学习率衰减因子
+INNER_STEP_LR_DECAY = 0.95
+
+# [新增] 温度退火参数
+INITIAL_TEMPERATURE = 1.5  # 初始温度（较高值促进探索），建议1.0-2.0
+TEMPERATURE_DECAY = 0.95  # 每步温度衰减率（<1.0 以逐渐降低随机性），建议0.9-0.99
+MIN_TEMPERATURE = 0.1  # 最小温度阈值，防止过度确定性
 
 
 # ------------------------------------
@@ -96,13 +111,14 @@ PROCESSED_DATA_PATH_CORNELL = "./data/cornell_processed/processed_dialogues.json
 
 # --- LCCC 中文对话数据集 ---
 # 原始数据路径
-LCCC_RAW_PATH = "./src/data/LCCC"
-LCCC_TRAIN_FILE = f"{LCCC_RAW_PATH}/LCCC-base_train.json"
-LCCC_VALID_FILE = f"{LCCC_RAW_PATH}/LCCC-base_valid.json"
-LCCC_TEST_FILE = f"{LCCC_RAW_PATH}/LCCC-base_test.json"
+dataset_path = 'F:/modelTrain'
+LCCC_RAW_PATH = os.path.join(dataset_path, 'data/LCCC')  # 使用相对路径
+LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.json')
+LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.json')
+LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.json')
 
-# 处理后的数据保存路径
-LCCC_PROCESSED_PATH = "./data/lccc_processed"
+# 处理后的数据保存路径 - 根据您的项目结构修正路径
+LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data/lccc_processed')
 
 
 # 最小和最大对话长度（按句子数）
@@ -113,5 +129,5 @@ MAX_CONVO_LENGTH = 25
 # ------------------------------------
 # 二进制数据处理
 # ------------------------------------
-# 在内存中一次处理的对话数量，用于生成二进制数据块
-CHUNK_SIZE = 100000 
+# 在内存中一次处理的对话数量，用于生成二进制数据块 - 减小以适应内存
+CHUNK_SIZE = 20000 
