@@ -208,7 +208,7 @@ class StaticHead(nn.Module):
         if self.random_pool_dim < self.num_random:
             raise ValueError("Random sampling pool is smaller than the number of items to sample.")
 
-        self.random_sampler = nn.Linear(self.random_pool_dim, self.num_random)  # 新增：可学习采样权重生成器
+        self.random_sampler = nn.Linear(self.random_pool_dim, self.random_pool_dim)  # 修正: 输出维度应为池大小
 
         # 拼接后的维度：采样状态 + 注意力上下文
         concatenated_dim = self.sampler_output_dim + context_input_dim
@@ -242,11 +242,14 @@ class StaticHead(nn.Module):
         # 2. 随机采样 (从剩余的神经元池中)
         random_pool = h_from_dynamic[:, self.num_fixed:]
 
-        sampling_logits = self.random_sampler(random_pool)  # 生成采样logits (batch, num_random)
+        sampling_logits = self.random_sampler(random_pool)  # 生成采样logits (batch, random_pool_dim)
         sampling_probs = F.softmax(sampling_logits, dim=1)  # 转换为概率
 
-        rand_indices = torch.multinomial(sampling_probs, 1).squeeze(1)  # 采样索引 (batch)
-        random_sample = random_pool[torch.arange(random_pool.size(0)), rand_indices]  # 提取采样 (batch, num_random)
+        # 修正：采样 self.num_random 个索引
+        rand_indices = torch.multinomial(sampling_probs, self.num_random, replacement=False)  # (batch, num_random)
+
+        # 修正：使用 gather 从池中提取样本
+        random_sample = torch.gather(random_pool, 1, rand_indices)  # (batch, num_random)
 
         # 3. 拼接采样结果
         sampled_state = torch.cat((fixed_sample, random_sample), dim=1)
