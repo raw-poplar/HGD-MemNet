@@ -62,8 +62,9 @@ class ReservoirRNNCell(nn.Module):
         self.use_hard_sampling = use_hard_sampling
         self.W_ih = nn.Linear(input_size, hidden_size, bias=True)
         # 可训练权重矩阵：(hidden_out, hidden_in)，每个行代表一个输出神经元的出边权重到输入神经元。
-        self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        init.xavier_uniform_(self.W_hh_matrix)  # 优化初始化 for 稳定性
+        self.W_hh_fixed = nn.Parameter(torch.empty(hidden_size, hidden_size), requires_grad=False)
+        self.register_buffer('W_hh_virtual', torch.zeros(hidden_size, hidden_size)) # 虚拟权重，作为缓冲区
+        init.xavier_uniform_(self.W_hh_fixed)
     
     def forward(self, x_t, h_prev, temperature=None):
         """
@@ -111,8 +112,9 @@ class ReservoirRNNCell(nn.Module):
         # 步骤1: 计算输入到隐藏的贡献 (batch, hidden)
         input_contrib = self.W_ih(x_t)
         
-        # 步骤2: 准备 logits - 应用温度缩放 (1, hidden_out, hidden_in)
-        logits = (self.W_hh_matrix / tau).unsqueeze(0)
+        # 步骤2: 结合固定权重和虚拟权重，并准备 logits
+        W_hh_effective = self.W_hh_fixed + self.W_hh_virtual
+        logits = (W_hh_effective / tau).unsqueeze(0)
         
         # 步骤3: 矢量化 Gumbel-Softmax 采样 - 重复到批次维度 (batch, hidden_out, hidden_in)
         # 公式: y_i = softmax((log π_i + g_i) / τ), 其中 g_i ~ Gumbel(0,1), τ 是温度
@@ -126,6 +128,20 @@ class ReservoirRNNCell(nn.Module):
         
         # 步骤5: 组合并激活
         h_next = torch.tanh(input_contrib + contrib)
+
+        # --- 新增: 实时赫布更新虚拟权重 ---
+        with torch.no_grad():
+            # 1. 衰减旧的虚拟权重
+            self.W_hh_virtual.mul_(1 - config.FAST_WEIGHT_DECAY)
+            
+            # 2. 计算赫布更新增量 (外积)
+            # h_next是输出激活，h_prev是输入激活
+            # (batch, out_features) x (batch, in_features) -> (batch, out_features, in_features)
+            hebbian_update = torch.bmm(h_next.unsqueeze(2), h_prev.unsqueeze(1))
+            
+            # 3. 应用更新 (取批次均值)
+            self.W_hh_virtual.add_(hebbian_update.mean(dim=0) * config.FAST_WEIGHT_LR)
+
         
         return h_next
 
@@ -152,12 +168,13 @@ class DynamicGroup(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)  # 新增：LayerNorm for RNN输出
 
-    def forward(self, x_t, x_ref_encoded, h_prev):
+    def forward(self, x_t, x_ref_encoded, h_prev, temperature=None):
         """
         Args:
             x_t (torch.Tensor): 当前时间步的输入, shape: (batch_size, seq_len, embed_dim)
             x_ref_encoded (torch.Tensor): 经过编码的参照输入, shape: (batch_size, ref_seq_len, hidden_dim)
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch_size, hidden_dim)
+            temperature (float, optional): 用于Gumbel-Softmax的温度参数. Defaults to None.
             
         Returns:
             h_next (torch.Tensor): 当前步的输出隐藏状态, shape: (batch_size, hidden_dim)
@@ -180,7 +197,7 @@ class DynamicGroup(nn.Module):
         # 3. 将拼接后的向量输入到核心RNN
         # h_prev shape: (batch_size, hidden_dim) for our cell
         # rnn_input is squeezed to (batch_size, embed_dim + hidden_dim)
-        h_next = self.core_rnn(rnn_input, h_prev)  # 更新：传入编码后的x_t_encoded
+        h_next = self.core_rnn(rnn_input, h_prev, temperature=temperature)  # 更新：传入编码后的x_t_encoded和温度参数
 
         h_next = self.norm(h_next)  # 应用LayerNorm
 
@@ -283,14 +300,15 @@ class HGD_MemNet(nn.Module):
             random_ratio=config.RANDOM_SAMPLING_RATIO
         )
 
-    def forward(self, x_t, x_ref, h_prev):
+    def forward(self, x_t, x_ref, h_prev, temperature=None):
         """
         一次完整的思考步骤
-        
+
         Args:
             x_t (torch.Tensor or None): 当前步的输入张量, shape: (batch, seq_len)
             x_ref (torch.Tensor): 参照输入张量, shape: (batch, ref_seq_len)
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch, dynamic_hidden_dim)
+            temperature (float, optional): 传递给核心RNN的温度参数. Defaults to None.
 
         Returns:
             h_next (torch.Tensor): 下一步的隐藏状态
@@ -308,12 +326,21 @@ class HGD_MemNet(nn.Module):
         
         # 3. 通过动态组进行一步演化
         # 传入编码后的x_ref作为key, 获得下一步的隐藏状态和该步的注意力上下文
-        h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev)
+        h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev, temperature=temperature)
 
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)
         
         return h_next, gate_pred, output_logits
+
+    def reset_virtual_weights(self):
+        """
+        [新增方法] 重置核心RNN单元中的虚拟权重。
+        在处理每个新的、独立的对话样本（或批次）之前调用此方法，
+        以防止短期记忆（虚拟权重）从一个样本泄露到下一个样本，确保训练的纯净性。
+        """
+        self.dynamic_group.core_rnn.W_hh_virtual.fill_(0)
+
 
 
 # 这是一个简单的测试，确保我们的类能正常工作
