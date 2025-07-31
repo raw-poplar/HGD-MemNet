@@ -6,7 +6,7 @@ import json
 import os
 import glob
 from tqdm import tqdm
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 
 # 新增：性能优化
 import torch.backends.cudnn as cudnn
@@ -37,6 +37,7 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     steps_updated = 0
     
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+    model.reset_virtual_weights()  # [新增] 重置虚拟权重，确保每个批次都有一个干净的短期记忆环境
     
     original_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
     
@@ -111,6 +112,7 @@ def validate_model(model):
         for x_ref_padded, steps_data in pbar:
             x_ref_padded = x_ref_padded.to(DEVICE)
             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+            model.reset_virtual_weights() # [新增] 同样在验证时重置，保证评估的公平性
             
             for x_t, y_t, g_t in steps_data:
                 x_t = x_t.to(DEVICE) if x_t is not None else None

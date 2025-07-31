@@ -5,7 +5,12 @@
 ## 核心特性
 
 *   **分层门控记忆模型**: 核心模型 `HGD_MemNet` 包含：
-    *   **动态神经组 (Dynamic Neural Group)**: 通过循环隐藏状态 `h` 捕获对话的短期记忆，在每个“思考步骤”中进行演化。动态神经组中的神经元两两相连，其中的数据会在模型启动的时候不断进行数据交换，类似蓄水池网络，但是该网络在动态神经组中的权重是可训练的，目前的训练思路是每进行一次数据交换（即一个时间步）就进行一次损失计算以及反向传播且随着对同一输入的反向传播修改的参数（即学习率）会逐步降低，这样来令模型随着思考深入逐渐靠近答案。新增：x_t 的独立 GRU 编码器、LayerNorm 和温度退火支持。
+    *   **动态神经组 (Dynamic Neural Group)**: 通过循环隐藏状态 `h` 捕获对话的短期记忆，在每个“思考步骤”中进行演化。动态神经组中的神经元两两相连，其中的数据会在模型启动的时候不断进行数据交换，类似蓄水池网络，但是该网络在动态神经组中的权重是可训练的，目前的训练思路是每进行一次数据交换（即一个时间步）就进行一次损失计算以及反向传播且随着对同一输入的反向传播修改的参数（即学习率）会逐步降低，这样来令模型随着思考深入逐渐靠近答案。
+    新增：x_t 的独立 GRU 编码器、LayerNorm 和温度退火支持。
+    2025/7/31新增：实现了一种复杂的**双组分权重系统**：
+    - **固定权重 (`W_hh_fixed`)**: 一组在初始化后保持不变的权重，构成了网络的“静态骨架”，如同一个“蓄水池”，提供了稳定的基础连接。
+    - **虚拟权重 (`W_hh_virtual`)**: 一组在对话过程中**实时动态更新**的权重。它充当了模型的“短期可塑性记忆”。在每次“思考”时，该权重会根据“赫布定律”（即“共同激发的神经元，其连接会得到加强”）自主更新，从而捕捉当前对话的即时上下文。
+
     *   **静态神经组 (Static Neural Group)**: 分为两部分一部分，一部分与固定的30%的动态神经组的神经元相连接，一部分则随机与5%数量的动态神经组的神经元相连接，用于提取整个对话历史的全局上下文表示。新增：可学习随机采样权重。
     *   **门控机制**: 一个门控单元负责在每个步骤中决策是继续“思考”（更新短期记忆）还是生成回应，当门控机制判断需要生成回应的时候想静态神经组输出一个激发，由静态神经组来输出。注：在模型生成回应的时候模型仍然会继续思考,即动态神经组仍然会继续数据交换。
 
@@ -19,7 +24,7 @@ graph TD
     inp_xt["Input: x_t (Current Turn)"]
     inp_xref["Input: x_ref (History)"]
     inp_hprev["Input: h_prev (Previous State)"]
-    inp_tau["Input: temperature (Dynamic)"]  # 新增：温度输入
+    inp_tau["Input: temperature (Dynamic)"]
 
     subgraph "Embedding Layer"
         style EmbeddingLayer fill:#f9f9f9,stroke:#333,stroke-width:2px
@@ -33,14 +38,14 @@ graph TD
     subgraph "Dynamic Group (State Evolution & Contextualization)"
         style DynamicGroup fill:#f9f9f9,stroke:#333,stroke-width:2px
         embed_xref -- "Embedded History" --> D_Encoder["Encoder (GRU)"]
-        embed_xt -- "Embedded Current" --> D_xtEncoder["x_t Encoder (GRU)"]  # 新增：x_t编码器
+        embed_xt -- "Embedded Current" --> D_xtEncoder["x_t Encoder (GRU)"]
         D_Encoder -- "History<br/>Representation" --> D_Attention["Attention"]
         inp_hprev -- "Query" --> D_Attention
         D_Attention -- "Context Vector<br/>(attn_context)" --> D_CoreRNN["Core RNN<br/>(ReservoirRNNCell)"]
         D_xtEncoder -- "Encoded x_t" --> D_CoreRNN
         inp_hprev -- "Previous State" --> D_CoreRNN
-        inp_tau -- "Temperature" --> D_CoreRNN  # 新增：温度传入
-        D_CoreRNN -- "h_next" --> D_Norm["LayerNorm"]  # 新增：LayerNorm
+        inp_tau -- "Temperature" --> D_CoreRNN
+        D_CoreRNN -- "h_next" --> D_Norm["LayerNorm"]
     end
     
     D_Norm -- "Normalized h_next" --> S_Head["Static Head"]
@@ -50,7 +55,7 @@ graph TD
         style StaticHead fill:#f9f9f9,stroke:#333,stroke-width:2px
         S_Head -- "Combined State" --> S_Gate["Gate Network"]
         S_Head -- "Combined State" --> S_Output["Output Network"]
-        S_Head -- "Random Pool" --> S_Sampler["Learned Sampler (Linear + Softmax)"]  # 新增：可学习采样
+        S_Head -- "Random Pool" --> S_Sampler["Learned Sampler (Linear + Softmax)"]
     end
 
     subgraph "Outputs"
@@ -63,6 +68,9 @@ graph TD
     classDef input fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
     class inp_xt,inp_xref,inp_hprev,inp_tau input;
 ```
+
+**架构核心更新**:
+上图的核心 `Core RNN (ReservoirRNNCell)` 组件已经实现了重大升级。它内部包含了我们原创的**双组分权重系统**：一个固定的 `W_hh_fixed` 权重矩阵和一个根据赫布定律在对话中实时更新的 `W_hh_virtual` 虚拟权重矩阵。这使得模型在拥有稳定结构的同时，具备了前所未有的即时上下文适应能力，能够根据对话流动态地、临时地调整其内部信息通路。
 
 ## 项目结构
 
@@ -78,7 +86,7 @@ HGD-MemNet_for_GitHub/
     ├── dataset.py            # 高效的二进制数据集加载器 BinaryDialogueDataset
     ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
     ├── train.py              # 主训练脚本
-    ├── evaluate.py           # 模型评估脚本
+    ├── evaluation.py         # 模型评估脚本
     ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
     └── ...
 ```
@@ -88,8 +96,8 @@ HGD-MemNet_for_GitHub/
 ### 1. 克隆仓库
 
 ```bash
-git clone <你的仓库URL>
-cd HGD-MemNet_for_GitHub
+git clone https://github.com/raw-poplar/HGD-MemNet.git
+cd HGD-MemNet
 ```
 
 ### 2. 安装依赖
@@ -155,9 +163,12 @@ streamlit run src/chat_web.py  # Web 演示
 ## 原创性声明
 本项目提出的 **HGD-MemNet** (分层门控对话记忆网络) 及其配套技术方案，由作者 [raw-poplar](https://github.com/raw-poplar) 原创设计并实现，若需使用请标上原作者。其核心创新点在于：
 
-- 提出了一种新颖的分层门控动态记忆架构，包含可进行权重学习的动态神经组 (DNG) 和负责全局上下文的静态神经组 (SNG)，通过门控单元协调记忆更新与回应生成。
+- **分层门控动态记忆架构**: 提出了一种包含动态神经组 (DNG) 和静态神经组 (SNG) 的新颖架构，通过门控单元协调记忆更新与回应生成。
 
-- 创新性地设计了动态神经组的可训练数据交换机制及其按时间步渐进式训练策略，使模型能在思考过程中逐步逼近最优解。
+- **双组分权重系统**: 在动态神经组中，创新性地设计了由“固定权重”和“虚拟权重”构成的双组分系统，兼顾了模型的结构稳定性与动态适应性。
+
+- **实时赫布更新机制**: 实现了基于赫布定律的虚拟权重实时更新机制，使模型能够在对话过程中自主调整内部连接，具备了快速、自适应的短期可塑性。
+
 本项目代码、模型架构及相关技术方案均为原创成果。
 
 ## 许可证

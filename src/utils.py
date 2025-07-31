@@ -30,7 +30,7 @@ def compute_loss(gate_pred, gate_target, output_logits, target_padded):
     """计算单个步骤的损失。"""
     import torch.nn as nn
     gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
-    loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target)
+    loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target.unsqueeze(1))
     if target_padded is not None:
         output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
             output_logits.view(-1, config.VOCAB_SIZE), 

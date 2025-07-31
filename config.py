@@ -23,6 +23,13 @@ CONTEXT_VECTOR_DIM = 128
 FIXED_SAMPLING_RATIO = 0.3
 RANDOM_SAMPLING_RATIO = 0.05
 
+# --- 新增：快速权重（实时更新）参数 ---
+# “赫布学习”更新的学习率
+FAST_WEIGHT_LR = 0.005
+# 快速权重的衰减率，防止无限增长
+FAST_WEIGHT_DECAY = 0.001
+
+
 
 # ------------------------------------
 # 特殊词元 (Special Tokens)
@@ -111,11 +118,11 @@ PROCESSED_DATA_PATH_CORNELL = "./data/cornell_processed/processed_dialogues.json
 
 # --- LCCC 中文对话数据集 ---
 # 原始数据路径
-dataset_path = 'F:/modelTrain'
+dataset_path = './lccc'
 LCCC_RAW_PATH = os.path.join(dataset_path, 'data/LCCC')  # 使用相对路径
-LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.json')
-LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.json')
-LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.json')
+LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.jsonl')
+LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.jsonl')
+LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.jsonl')
 
 # 处理后的数据保存路径 - 根据您的项目结构修正路径
 LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data/lccc_processed')

@@ -4,4 +4,6 @@ tqdm
 ijson
 psutil
 nltk
-pytest 
+pytest
+evaluate
+bert-score
