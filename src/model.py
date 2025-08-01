@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init  # 新增 for xavier
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import config
 
 # --- 注意力模块 (无变化) ---
@@ -175,7 +178,7 @@ class DynamicGroup(nn.Module):
             x_ref_encoded (torch.Tensor): 经过编码的参照输入, shape: (batch_size, ref_seq_len, hidden_dim)
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch_size, hidden_dim)
             temperature (float, optional): 用于Gumbel-Softmax的温度参数. Defaults to None.
-            
+
         Returns:
             h_next (torch.Tensor): 当前步的输出隐藏状态, shape: (batch_size, hidden_dim)
             attn_context (torch.Tensor): 注意力上下文向量, shape: (batch_size, hidden_dim)
@@ -184,8 +187,15 @@ class DynamicGroup(nn.Module):
         if x_t is None:
             x_t_encoded = torch.zeros(h_prev.size(0), self.hidden_dim, device=h_prev.device)
         else:
-            _, x_t_encoded = self.x_t_encoder(x_t)  # 使用GRU编码x_t，获取最后隐藏状态 (1, batch, hidden) -> squeeze to (batch, hidden)
-            x_t_encoded = x_t_encoded.squeeze(0)
+            # 修复：GRU返回(output, hidden)，hidden的shape是(num_layers, batch, hidden_size)
+            # 对于单层GRU，需要取最后一层的隐藏状态
+            _, x_t_encoded = self.x_t_encoder(x_t)
+            if x_t_encoded.dim() == 3:  # (num_layers, batch, hidden)
+                x_t_encoded = x_t_encoded[-1]  # 取最后一层，shape: (batch, hidden)
+            elif x_t_encoded.dim() == 2:  # 已经是(batch, hidden)
+                pass  # 保持不变
+            else:
+                raise ValueError(f"Unexpected x_t_encoded shape: {x_t_encoded.shape}")
         
         # 1. 使用注意力机制计算上下文向量
         # h_prev 是 query, x_ref_encoded 是 keys
@@ -345,6 +355,12 @@ class HGD_MemNet(nn.Module):
 
 # 这是一个简单的测试，确保我们的类能正常工作
 if __name__ == '__main__':
+    # 修复导入问题
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    import config
+
     # --- 测试 DynamicGroup (已有代码) ---
     print("--- 测试 DynamicGroup (新版) ---")
     batch_size = 4  # 使用较小的批处理大小进行测试
@@ -430,7 +446,9 @@ if __name__ == '__main__':
 
     # 新: 测试高级RNN cell
     rnn_cell = ReservoirRNNCell(hidden_dim + hidden_dim, hidden_dim, initial_temperature=1.5, use_hard_sampling=True)  # 更新输入大小
-    h_next_test = rnn_cell(x_t_embed.squeeze(1), h_prev, temperature=0.5)  # 测试动态温度
+    # 修正：创建正确维度的测试输入 (batch_size, hidden_dim + hidden_dim)
+    test_input = torch.randn(batch_size, hidden_dim + hidden_dim)
+    h_next_test = rnn_cell(test_input, h_prev, temperature=0.5)  # 测试动态温度
     print(f'高级RNN cell 输出形状: {h_next_test.shape}')
     assert h_next_test.shape == (batch_size, hidden_dim)
     print('高级RNN cell 测试通过！')

@@ -103,7 +103,16 @@ class BinaryDialogueDataset(Dataset):
             raise FileNotFoundError(f"在 '{directory_path}' 中未找到数据块文件 (chunk_*.pt)。")
 
         # 计算每个块的样本数和总样本数
-        self.chunk_lengths = [len(torch.load(f)) for f in self.chunk_files]
+        print("正在计算数据块大小...")
+        self.chunk_lengths = []
+        for f in self.chunk_files:
+            try:
+                chunk_data = torch.load(f, weights_only=True)
+                self.chunk_lengths.append(len(chunk_data))
+            except Exception as e:
+                print(f"警告：无法加载数据块 {f}: {e}")
+                self.chunk_lengths.append(0)
+
         self.cumulative_lengths = [0] + list(torch.cumsum(torch.tensor(self.chunk_lengths), dim=0))
         self.total_length = self.cumulative_lengths[-1].item()
 
@@ -129,8 +138,11 @@ class BinaryDialogueDataset(Dataset):
         
         # 2. 如果需要的块不是当前缓存的块，则加载新块
         if chunk_index != self.current_chunk_index:
-            self.current_chunk_data = torch.load(self.chunk_files[chunk_index])
-            self.current_chunk_index = chunk_index
+            try:
+                self.current_chunk_data = torch.load(self.chunk_files[chunk_index], weights_only=True)
+                self.current_chunk_index = chunk_index
+            except Exception as e:
+                raise RuntimeError(f"无法加载数据块 {self.chunk_files[chunk_index]}: {e}")
         
         # 3. 计算在块内的局部索引
         local_idx = idx - self.cumulative_lengths[chunk_index]

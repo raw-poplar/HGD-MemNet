@@ -160,4 +160,10 @@ cython_debug/
 # 忽略检查点和数据目录
 checkpoints/
 processed_data/
-logs/ 
+logs/
+
+# User-added ignores
+.augment/
+.idea/
+lccc/
+CODE_REVIEW_REPORT.md

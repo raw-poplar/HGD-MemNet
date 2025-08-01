@@ -120,9 +120,10 @@ def validate_model(model):
                 g_t = g_t.to(DEVICE)
 
                 # 新增：在验证时使用硬采样和低温
+                original_sampling_mode = model.dynamic_group.core_rnn.use_hard_sampling
                 model.dynamic_group.core_rnn.use_hard_sampling = True  # 切换到硬采样
                 h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温
-                model.dynamic_group.core_rnn.use_hard_sampling = False  # 恢复
+                model.dynamic_group.core_rnn.use_hard_sampling = original_sampling_mode  # 恢复原始设置
                 
                 # 使用 utils 中的 compute_loss
                 step_loss = compute_loss(gate_pred, g_t, output_logits, y_t)

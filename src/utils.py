@@ -29,13 +29,22 @@ def load_model_from_checkpoint(directory, device):
 def compute_loss(gate_pred, gate_target, output_logits, target_padded):
     """计算单个步骤的损失。"""
     import torch.nn as nn
-    gate_pred_logits = torch.log(gate_pred / (1.0 - gate_pred) + 1e-9)
-    loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target.unsqueeze(1))
-    if target_padded is not None:
+
+    # 修正：确保gate_pred在有效范围内，避免log(0)或log(1)
+    gate_pred_clamped = torch.clamp(gate_pred, min=1e-7, max=1-1e-7)
+    gate_pred_logits = torch.log(gate_pred_clamped / (1.0 - gate_pred_clamped))
+
+    # 修正：确保gate_target的维度匹配
+    if gate_target.dim() == 1:
+        gate_target = gate_target.unsqueeze(1)
+
+    loss = nn.BCEWithLogitsLoss()(gate_pred_logits, gate_target)
+
+    if target_padded is not None and target_padded.numel() > 0:
         output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(
-            output_logits.view(-1, config.VOCAB_SIZE), 
+            output_logits.view(-1, config.VOCAB_SIZE),
             target_padded.view(-1)
         )
         if not torch.isnan(output_loss):
             loss += output_loss
-    return loss 
+    return loss

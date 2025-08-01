@@ -38,7 +38,9 @@ def generate_response(model, vocab, user_input, history, h_prev):
     history_indices = []
     if history:
         history_indices = indexesFromSentence(vocab, " ".join(history))
-    x_ref = torch.tensor(history_indices).unsqueeze(0).to(model.device)
+    # 修正：获取模型设备
+    device = next(model.parameters()).device
+    x_ref = torch.tensor(history_indices).unsqueeze(0).to(device)
     
     with torch.no_grad():
         h_next, gate, output_logits = model(x_t, x_ref, h_prev)
