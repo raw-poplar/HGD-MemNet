@@ -110,15 +110,15 @@ PROCESSED_DATA_PATH_CORNELL = "./data/cornell_processed/processed_dialogues.json
 
 
 # --- LCCC 中文对话数据集 ---
-# 原始数据路径
-dataset_path = 'F:/modelTrain'
-LCCC_RAW_PATH = os.path.join(dataset_path, 'data/LCCC')  # 使用相对路径
+# 原始数据路径 - 建议使用环境变量或相对路径
+dataset_path = os.environ.get('DATASET_PATH', 'F:/modelTrain')  # 使用您的实际路径
+LCCC_RAW_PATH = os.path.join(dataset_path, 'LCCC')
 LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.json')
 LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.json')
 LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.json')
 
 # 处理后的数据保存路径 - 根据您的项目结构修正路径
-LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data/lccc_processed')
+LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data', 'lccc_processed')
 
 
 # 最小和最大对话长度（按句子数）

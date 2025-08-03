@@ -8,7 +8,7 @@ from functools import partial
 import psutil
 import glob # Added for chunking
 import json  # 新增，确保已导入
-from multiprocessing import Pool, cpu_count  # 新增 for 多进程
+from multiprocessing import Pool, cpu_count, Manager  # 新增 for 多进程
 from itertools import islice # Added for islice
 import logging  # 新增：日志记录
 import sys
@@ -24,6 +24,38 @@ def indexesFromSentence(vocab, sentence):
         return []
     UNK_idx = vocab.word2index.get("<UNK>", config.UNK_token)
     return [vocab.word2index.get(word, UNK_idx) for word in sentence.split(' ')] + [config.EOS_token]
+
+# 全局变量，用于多进程
+_global_vocab = None
+
+def init_worker(vocab_state):
+    """初始化工作进程"""
+    global _global_vocab
+    from src.dataset import Vocabulary
+    _global_vocab = Vocabulary("worker")
+    _global_vocab.__dict__.update(vocab_state)
+
+def process_batch_optimized(batch_lines):
+    """优化的批处理函数 - 返回可序列化的数据"""
+    global _global_vocab
+    results = []
+    for line in batch_lines:
+        try:
+            dialogue = json.loads(line)
+            tensor_data = process_dialogue_to_tensors(dialogue, _global_vocab)
+            if tensor_data:
+                # 转换为可序列化的格式
+                x_ref, steps_data = tensor_data
+                serializable_data = (
+                    x_ref.tolist(),  # 转换为列表
+                    [(x_t.tolist() if x_t is not None else None,
+                      target.tolist(),
+                      gate.tolist()) for x_t, target, gate in steps_data]
+                )
+                results.append(serializable_data)
+        except json.JSONDecodeError:
+            pass
+    return results
 
 def process_dialogue_to_tensors(dialogue_list, vocab):
     """
@@ -50,11 +82,12 @@ def process_dialogue_to_tensors(dialogue_list, vocab):
 
         # 模拟模型的 "思考" 步骤
         # 在这个简化的设定中，我们为每个真实回答前都添加N个“思考”步骤
-        # 在这些步骤中，模型没有输出，只有门控目标为0
+        # 在这些步骤中，模型没有当前输入，只有门控目标为0
         for _ in range(config.THINKING_STEPS):
-            thinking_step_x_t = torch.tensor(indexesFromSentence(vocab, x_t_text), dtype=torch.long)
+            # 思考步骤没有当前输入（使用None或空张量）
+            thinking_step_x_t = None  # 或者使用 torch.tensor([], dtype=torch.long)
             # 思考步骤没有目标输出
-            thinking_step_target = torch.tensor([], dtype=torch.long) 
+            thinking_step_target = torch.tensor([], dtype=torch.long)
             # 门控目标为0，表示不输出
             thinking_step_gate = torch.tensor([0.0], dtype=torch.float)
             steps_data.append((thinking_step_x_t, thinking_step_target, thinking_step_gate))
@@ -114,7 +147,7 @@ def convert_to_binary(data_type, vocab, input_dir, output_dir, num_workers=1):
     # 不再删除旧的块文件，支持续传
     # 为 resume，检查现有的块并加载状态
     resume_file = os.path.join(chunk_dir, "resume.json")
-    SAVE_PARTIAL_EVERY = 1000  # 每处理多少个对话保存一次 partial
+    SAVE_PARTIAL_EVERY = 5000  # 每处理多少个对话保存一次 partial
     if os.path.exists(resume_file):
         with open(resume_file, 'r') as rf:
             resume_state = json.load(rf)
@@ -171,25 +204,50 @@ def convert_to_binary(data_type, vocab, input_dir, output_dir, num_workers=1):
         pbar = tqdm(total=total_lines - processed_lines if total_lines else None, desc=f"转换 {data_type}", unit=" 对话", initial=processed_lines, mininterval=0.01)
         
         if num_workers > 1:
-            # 多进程模式：分批读取并处理
-            BATCH_SIZE = 1000  # 每批处理的行数
-            pool = Pool(num_workers)
-            while True:
-                batch_lines = list(islice(f, BATCH_SIZE))
-                if not batch_lines:
-                    break
-                # 并行处理批次
-                results = pool.starmap(process_line, [(line, vocab) for line in batch_lines])
-                for result in results:
-                    processed_lines += 1
-                    if result:
-                        processed_dialogues.append(result)
-                    pbar.update(1)
-                    # chunking 和 partial 保存逻辑 (同单线程)
+            # 优化的多进程模式
+            BATCH_SIZE = max(100, 2000 // num_workers)  # 动态调整批次大小
+
+            # 准备词汇表状态用于工作进程
+            vocab_state = vocab.__dict__.copy()
+
+            # 创建进程池，使用初始化函数
+            pool = Pool(num_workers, initializer=init_worker, initargs=(vocab_state,))
+
+            try:
+                batch_count = 0
+                while True:
+                    batch_lines = list(islice(f, BATCH_SIZE))
+                    if not batch_lines:
+                        break
+
+                    batch_count += 1
+
+                    # 并行处理批次 - 返回处理好的结果列表
+                    batch_results = pool.apply_async(process_batch_optimized, (batch_lines,))
+
+                    # 获取结果并重新构建张量
+                    serializable_results = batch_results.get()
+
+                    # 转换回张量格式
+                    for x_ref_list, steps_list in serializable_results:
+                        x_ref_tensor = torch.tensor(x_ref_list, dtype=torch.long)
+                        steps_tensors = []
+                        for x_t_list, target_list, gate_list in steps_list:
+                            x_t_tensor = torch.tensor(x_t_list, dtype=torch.long) if x_t_list is not None else None
+                            target_tensor = torch.tensor(target_list, dtype=torch.long)
+                            gate_tensor = torch.tensor(gate_list, dtype=torch.float)
+                            steps_tensors.append((x_t_tensor, target_tensor, gate_tensor))
+                        processed_dialogues.append((x_ref_tensor, steps_tensors))
+
+                    # 更新统计
+                    processed_lines += len(batch_lines)
+                    pbar.update(len(batch_lines))
+
+                    # 检查是否需要保存chunk
                     if len(processed_dialogues) >= config.CHUNK_SIZE:
                         chunk_file = os.path.join(chunk_dir, f"chunk_{chunk_index}.pt")
                         torch.save(processed_dialogues, chunk_file)
-                        pbar.write(f"已保存块 {chunk_index} 到 {chunk_file}")
+                        pbar.write(f"已保存块 {chunk_index} 到 {chunk_file} (批次 {batch_count})")
                         chunk_index += 1
                         processed_dialogues = []
                         # 更新 resume，无 partial
@@ -202,11 +260,15 @@ def convert_to_binary(data_type, vocab, input_dir, output_dir, num_workers=1):
                         # 更新 resume，有 partial
                         with open(resume_file, 'w') as rf:
                             json.dump({'chunk_index': chunk_index, 'processed_lines': processed_lines, 'has_partial': True}, rf)
-                # 批次后更新 resume
-                with open(resume_file, 'w') as rf:
-                    json.dump({'chunk_index': chunk_index, 'processed_lines': processed_lines, 'has_partial': len(processed_dialogues) > 0}, rf)
-            pool.close()
-            pool.join()
+
+                    # 定期更新 resume
+                    if batch_count % 10 == 0:
+                        with open(resume_file, 'w') as rf:
+                            json.dump({'chunk_index': chunk_index, 'processed_lines': processed_lines, 'has_partial': len(processed_dialogues) > 0}, rf)
+
+            finally:
+                pool.close()
+                pool.join()
         else:
             # 单线程模式 (原有循环)
             for line in f:
@@ -299,13 +361,21 @@ if __name__ == "__main__":
 
         # 3. 转换所有数据集类型
         for data_type in ["train", "valid", "test"]:
-            convert_to_binary(
-                data_type=data_type,
-                vocab=vocab,
-                input_dir=config.LCCC_PROCESSED_PATH,
-                output_dir=config.LCCC_PROCESSED_PATH, # 输出到处理后的数据目录
-                num_workers=args.num_workers
-            )
+            print(f"\n=== 开始处理 {data_type} 数据集 ===")
+            try:
+                convert_to_binary(
+                    data_type=data_type,
+                    vocab=vocab,
+                    input_dir=config.LCCC_PROCESSED_PATH,
+                    output_dir=config.LCCC_PROCESSED_PATH, # 输出到处理后的数据目录
+                    num_workers=args.num_workers
+                )
+                print(f"✅ {data_type} 数据集处理完成")
+            except Exception as e:
+                print(f"❌ {data_type} 数据集处理失败: {e}")
+                logging.error(f"{data_type} 处理失败: {e}")
+                # 继续处理下一个数据集
+                continue
 
         print("\n--- 所有数据文件分块转换完成！ ---")
         logging.info("数据转换完成")

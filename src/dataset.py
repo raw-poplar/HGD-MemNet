@@ -103,7 +103,7 @@ class BinaryDialogueDataset(Dataset):
             raise FileNotFoundError(f"在 '{directory_path}' 中未找到数据块文件 (chunk_*.pt)。")
 
         # 计算每个块的样本数和总样本数
-        self.chunk_lengths = [len(torch.load(f)) for f in self.chunk_files]
+        self.chunk_lengths = [len(torch.load(f, weights_only=True)) for f in self.chunk_files]
         self.cumulative_lengths = [0] + list(torch.cumsum(torch.tensor(self.chunk_lengths), dim=0))
         self.total_length = self.cumulative_lengths[-1].item()
 
@@ -129,7 +129,7 @@ class BinaryDialogueDataset(Dataset):
         
         # 2. 如果需要的块不是当前缓存的块，则加载新块
         if chunk_index != self.current_chunk_index:
-            self.current_chunk_data = torch.load(self.chunk_files[chunk_index])
+            self.current_chunk_data = torch.load(self.chunk_files[chunk_index], weights_only=True)
             self.current_chunk_index = chunk_index
         
         # 3. 计算在块内的局部索引
@@ -156,7 +156,11 @@ def binary_collate_fn(batch):
         for steps_list in steps_data_lists:
             if t < len(steps_list):
                 x_t, target, gate_target = steps_list[t]
-                x_t_batch.append(x_t)
+                # 处理None的x_t
+                if x_t is None:
+                    x_t_batch.append(torch.tensor([], dtype=torch.long))
+                else:
+                    x_t_batch.append(x_t)
                 target_batch.append(target)
                 gate_target_batch.append(gate_target)
                 if target.numel() > 0:
@@ -166,7 +170,12 @@ def binary_collate_fn(batch):
                 target_batch.append(torch.tensor([], dtype=torch.long))
                 gate_target_batch.append(torch.tensor([0.0], dtype=torch.float))
 
-        x_t_padded = pad_sequence(x_t_batch, batch_first=True, padding_value=config.PAD_token)
+        # 检查是否所有x_t都是空的
+        non_empty_x_t = [x for x in x_t_batch if x.numel() > 0]
+        if non_empty_x_t:
+            x_t_padded = pad_sequence(x_t_batch, batch_first=True, padding_value=config.PAD_token)
+        else:
+            x_t_padded = None
         
         target_padded = None
         if has_target_in_step:

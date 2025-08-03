@@ -109,9 +109,15 @@ class TestBinaryCollateFunction:
             x_ref = torch.randint(0, TEST_VOCAB_SIZE, (TEST_SEQ_LEN,))
             steps_data = []
             for j in range(TEST_THINKING_STEPS):
-                x_t = torch.randint(0, TEST_VOCAB_SIZE, (TEST_SEQ_LEN,)) if j > 0 else None
-                target = torch.randint(0, TEST_VOCAB_SIZE, (TEST_SEQ_LEN,))
-                gate_target = torch.randint(0, 2, (1,)).float()
+                # 思考步骤没有当前输入，输出步骤有输入
+                if j < TEST_THINKING_STEPS - 1:  # 思考步骤
+                    x_t = None
+                    target = torch.tensor([], dtype=torch.long)  # 空目标
+                    gate_target = torch.tensor([0.0], dtype=torch.float)  # 不输出
+                else:  # 输出步骤
+                    x_t = torch.randint(0, TEST_VOCAB_SIZE, (TEST_SEQ_LEN,))
+                    target = torch.randint(0, TEST_VOCAB_SIZE, (TEST_SEQ_LEN,))
+                    gate_target = torch.tensor([1.0], dtype=torch.float)  # 输出
                 steps_data.append((x_t, target, gate_target))
             
             batch_data.append((x_ref, steps_data))
@@ -127,7 +133,8 @@ class TestBinaryCollateFunction:
             x_t_batch, target_batch, gate_batch = step_data
             if x_t_batch is not None:
                 assert x_t_batch.shape[0] == TEST_BATCH_SIZE
-            assert target_batch.shape[0] == TEST_BATCH_SIZE
+            if target_batch is not None:
+                assert target_batch.shape[0] == TEST_BATCH_SIZE
             assert gate_batch.shape[0] == TEST_BATCH_SIZE
 
 

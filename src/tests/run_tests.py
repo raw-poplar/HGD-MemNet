@@ -73,21 +73,72 @@ def run_performance_tests():
     print("=" * 60)
     print("运行性能测试...")
     print("=" * 60)
-    
-    test_file = "test_performance.py"
-    print(f"\n运行 {test_file}...")
-    result = pytest.main([
-        os.path.join(os.path.dirname(__file__), test_file),
-        "-v",
-        "--tb=short",
-        "-s"  # 显示print输出
-    ])
-    if result != 0:
-        print(f"❌ {test_file} 测试失败")
-        return False
-    else:
-        print(f"✅ {test_file} 测试通过")
-    
+
+    test_files = [
+        "test_performance.py",
+        "test_quick_performance.py",
+        "test_multiprocessing_performance.py"
+    ]
+
+    for test_file in test_files:
+        print(f"\n运行 {test_file}...")
+        result = pytest.main([
+            os.path.join(os.path.dirname(__file__), test_file),
+            "-v",
+            "--tb=short",
+            "-s"  # 显示print输出
+        ])
+        if result != 0:
+            print(f"❌ {test_file} 测试失败")
+            return False
+        else:
+            print(f"✅ {test_file} 测试通过")
+
+    return True
+
+def run_utility_tests():
+    """运行实用测试（数据兼容性、设置检查等）"""
+    print("=" * 60)
+    print("运行实用测试...")
+    print("=" * 60)
+
+    utility_scripts = [
+        "test_current_setup.py",
+        "test_data_compatibility.py",
+        "test_existing_chunks.py",
+        "test_basic_processing.py",
+        "test_find_chunks.py"
+    ]
+
+    for script in utility_scripts:
+        script_path = os.path.join(os.path.dirname(__file__), script)
+        if os.path.exists(script_path):
+            print(f"\n运行 {script}...")
+            try:
+                result = subprocess.run([
+                    sys.executable, script_path
+                ], capture_output=True, text=True, timeout=120)
+
+                if result.returncode == 0:
+                    print(f"✅ {script} 执行成功")
+                    if result.stdout:
+                        print("输出:")
+                        print(result.stdout[-500:])  # 显示最后500字符
+                else:
+                    print(f"❌ {script} 执行失败")
+                    if result.stderr:
+                        print("错误:")
+                        print(result.stderr[-500:])
+                    return False
+            except subprocess.TimeoutExpired:
+                print(f"⏰ {script} 执行超时")
+                return False
+            except Exception as e:
+                print(f"❌ {script} 执行出错: {e}")
+                return False
+        else:
+            print(f"⚠️  {script} 不存在，跳过")
+
     return True
 
 def run_all_tests():
@@ -199,8 +250,8 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="HGD-MemNet 测试运行器")
     parser.add_argument(
-        "--type", 
-        choices=["unit", "integration", "performance", "all", "coverage"],
+        "--type",
+        choices=["unit", "integration", "performance", "utility", "all", "coverage"],
         default="all",
         help="要运行的测试类型"
     )
@@ -236,6 +287,8 @@ def main():
         success = run_integration_tests()
     elif args.type == "performance":
         success = run_performance_tests()
+    elif args.type == "utility":
+        success = run_utility_tests()
     elif args.type == "coverage":
         success = run_coverage_report()
     elif args.type == "all":

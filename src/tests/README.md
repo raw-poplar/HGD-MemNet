@@ -6,14 +6,22 @@
 
 ```
 src/tests/
-├── README.md                    # 本文件
-├── test_config.py              # 测试配置
-├── run_tests.py                # 测试运行脚本
-├── test_model_components.py    # 模型组件单元测试
-├── test_model_integration.py   # 模型集成测试
-├── test_training.py            # 训练流程测试
-├── test_data_processing.py     # 数据处理测试
-└── test_performance.py         # 性能测试
+├── README.md                       # 本文件
+├── test_config.py                  # 测试配置
+├── run_tests.py                    # 测试运行脚本
+├── test_model_components.py        # 模型组件单元测试
+├── test_model_integration.py       # 模型集成测试
+├── test_training.py                # 训练流程测试
+├── test_data_processing.py         # 数据处理测试
+├── test_performance.py             # 性能基准测试
+├── test_quick_performance.py       # 快速性能测试
+├── test_multiprocessing_performance.py  # 多进程性能测试
+├── test_simple_performance.py      # 简单性能测试
+├── test_current_setup.py           # 当前设置检查
+├── test_data_compatibility.py      # 数据兼容性测试
+├── test_existing_chunks.py         # 现有chunk文件测试
+├── test_basic_processing.py        # 基本处理功能测试
+└── test_find_chunks.py             # chunk文件查找测试
 ```
 
 ## 测试类型
@@ -45,6 +53,40 @@ src/tests/
   - 内存使用
   - 批次和序列长度扩展性
   - GPU vs CPU性能对比
+- **test_quick_performance.py**: 快速性能测试
+  - 核心处理性能
+  - 瓶颈分析
+  - 多进程收益估算
+- **test_multiprocessing_performance.py**: 多进程性能测试
+  - 单线程vs多线程对比
+  - 不同worker数量的性能
+  - 序列化开销分析
+- **test_simple_performance.py**: 简单性能测试
+  - 基本处理速度测试
+  - 优化效果分析
+
+### 4. 实用测试 (Utility Tests)
+- **test_current_setup.py**: 当前设置检查
+  - 路径配置验证
+  - 词汇表文件检查
+  - 数据文件状态
+  - 系统资源检查
+- **test_data_compatibility.py**: 数据兼容性测试
+  - 新旧数据格式兼容性
+  - 批处理兼容性
+  - 混合格式处理
+- **test_existing_chunks.py**: 现有chunk文件测试
+  - chunk文件加载测试
+  - 数据格式检查
+  - 继续处理设置验证
+- **test_basic_processing.py**: 基本处理功能测试
+  - 词汇表加载
+  - 对话处理
+  - 断点续传功能
+- **test_find_chunks.py**: chunk文件查找测试
+  - 自动查找chunk文件
+  - 文件完整性检查
+  - 处理状态分析
 
 ## 运行测试
 
@@ -70,6 +112,9 @@ python src/tests/run_tests.py --type integration
 
 # 性能测试
 python src/tests/run_tests.py --type performance
+
+# 实用测试
+python src/tests/run_tests.py --type utility
 
 # 覆盖率测试
 python src/tests/run_tests.py --type coverage
