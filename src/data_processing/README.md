@@ -44,6 +44,7 @@ python -m src.data_processing.prepare_binary_data --num_workers=4
 - `simple`: 简单一次性合并
 - `optimized`: 流式处理，内存友好
 - `large`: 专门处理大文件
+- `ultra`: 超级优化版，分段保存，支持断点续传
 
 **使用方法**:
 ```bash
@@ -52,6 +53,12 @@ python -m src.data_processing.merge_tools --method=optimized --dataset=all
 
 # 合并特定数据集
 python -m src.data_processing.merge_tools --method=large --dataset=train
+
+# 使用超级优化方法（推荐用于大文件）
+python -m src.data_processing.merge_tools --method=ultra --dataset=train --workers=2 --batch-size=20
+
+# 自定义参数的超级优化合并
+python -m src.data_processing.merge_tools --method=ultra --dataset=train --workers=1 --batch-size=10 --save-interval=30
 
 # 合并后验证和清理
 python -m src.data_processing.merge_tools --verify --cleanup
@@ -117,7 +124,10 @@ python -m src.data_processing.data_utils --check
 
 ### 步骤3: 合并数据
 ```bash
-# 合并chunk文件为最终数据集
+# 合并chunk文件为最终数据集（推荐用于大文件）
+python -m src.data_processing.merge_tools --method=ultra --dataset=all --workers=2
+
+# 或使用传统优化方法
 python -m src.data_processing.merge_tools --method=optimized --dataset=all
 ```
 
@@ -134,7 +144,28 @@ python -m src.data_processing.data_utils --cleanup
 python -m src.data_processing.merge_tools --cleanup
 ```
 
-## 🔧 配置说明
+## � 新增超级优化方法 (ultra)
+
+### 特性
+- ✅ **分段保存**: 避免内存溢出，支持超大文件
+- ✅ **真正的断点续传**: 从任意中断点继续
+- ✅ **内存友好**: 最小内存占用
+- ✅ **高效I/O**: 减少文件读写次数
+- ✅ **多线程支持**: 可配置工作线程数
+- ✅ **自动清理**: 完成后自动清理临时文件
+
+### 使用场景
+- 处理超大数据集（>100GB）
+- 内存受限的环境
+- 需要长时间运行的合并任务
+- 网络不稳定可能中断的环境
+
+### 参数说明
+- `--workers`: 工作线程数 (默认: 2)
+- `--batch-size`: 批处理大小 (默认: 20)
+- `--save-interval`: 保存间隔，每处理多少个chunk保存一次 (默认: 50)
+
+## �🔧 配置说明
 
 ### 环境变量
 - `DATASET_PATH`: 数据集根目录路径
@@ -200,6 +231,25 @@ python -m src.data_processing.debug_tools --test-compatibility
 ```
 
 ## 📈 性能优化
+
+### 方法选择建议
+- **小文件 (<10GB)**: 使用 `simple` 方法
+- **中等文件 (10-100GB)**: 使用 `optimized` 方法
+- **大文件 (>100GB)**: 使用 `ultra` 方法
+- **内存受限环境**: 优先使用 `ultra` 方法
+
+### 参数调优建议
+- **workers**:
+  - 内存充足: 2-4个线程
+  - 内存受限: 1个线程
+  - SSD存储: 可适当增加到4-8个
+- **batch-size**:
+  - 小内存: 10-20
+  - 大内存: 20-50
+  - SSD存储: 可增加到50-100
+- **save-interval** (ultra方法):
+  - 快速存储: 50-100
+  - 慢速存储: 20-50
 
 ### 多进程优化
 - 使用2-8个工作进程

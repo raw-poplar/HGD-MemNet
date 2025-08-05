@@ -16,8 +16,7 @@ import sys
 import json
 import gc
 import time
-import threading
-import queue
+
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
@@ -93,28 +92,28 @@ def merge_chunks_simple(data_type):
 def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
     """优化版合并 - 流式处理，内存友好"""
     print(f"🔄 优化合并 {data_type} (流式处理)...")
-    
+
     chunk_files = get_chunk_files(data_type)
     if not chunk_files:
         print(f"❌ 未找到chunk文件")
         return False
-    
+
     chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
     output_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}.pt")
     temp_file = output_file + ".tmp"
-    
+
     print(f"📦 找到 {len(chunk_files)} 个chunk文件")
-    
+
     # 检查输出文件
     if os.path.exists(output_file):
         response = input(f"⚠️  {output_file} 已存在，是否覆盖? (y/n): ")
         if response.lower() != 'y':
             return False
-    
+
     # 初始化临时文件
     torch.save([], temp_file)
     total_dialogues = 0
-    
+
     def load_chunk_worker(chunk_info):
         """工作线程：加载chunk"""
         chunk_num, chunk_file = chunk_info
@@ -125,7 +124,7 @@ def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
         except Exception as e:
             print(f"❌ 加载 {chunk_file} 失败: {e}")
             return chunk_num, None, 0
-    
+
     def append_to_temp_file(new_data):
         """追加数据到临时文件"""
         existing_data = torch.load(temp_file, weights_only=True)
@@ -133,16 +132,16 @@ def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
         torch.save(existing_data, temp_file)
         del existing_data
         gc.collect()
-    
+
     # 分批处理
     with tqdm(total=len(chunk_files), desc=f"合并{data_type}") as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for i in range(0, len(chunk_files), batch_size):
                 batch = chunk_files[i:i+batch_size]
-                
+
                 # 提交加载任务
                 futures = [executor.submit(load_chunk_worker, chunk_info) for chunk_info in batch]
-                
+
                 # 收集结果
                 batch_data = []
                 for future in futures:
@@ -151,26 +150,165 @@ def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
                         batch_data.extend(data)
                         total_dialogues += count
                         del data
-                
+
                 # 追加到文件
                 if batch_data:
                     append_to_temp_file(batch_data)
                     del batch_data
                     gc.collect()
-                
+
                 pbar.update(len(batch))
-    
+
     # 完成合并
     if os.path.exists(output_file):
         os.remove(output_file)
     os.rename(temp_file, output_file)
-    
+
     # 验证
     file_size = os.path.getsize(output_file) / (1024**3)
     print(f"✅ {data_type}.pt 保存成功")
     print(f"📊 总对话数: {total_dialogues:,}")
     print(f"📊 文件大小: {file_size:.2f} GB")
-    
+
+    return True
+
+def merge_chunks_ultra_optimized(data_type, max_workers=2, batch_size=20, save_interval=50):
+    """超级优化版合并 - 分段保存，真正的流式处理"""
+    print(f"🚀 超级优化合并 {data_type} (分段流式处理)...")
+
+    chunk_files = get_chunk_files(data_type)
+    if not chunk_files:
+        print(f"❌ 未找到chunk文件")
+        return False
+
+    chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
+    output_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}.pt")
+    temp_dir = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}_temp_segments")
+    resume_file = os.path.join(chunk_dir, f"resume_{data_type}.json")
+
+    print(f"📦 找到 {len(chunk_files)} 个chunk文件")
+
+    # 检查输出文件
+    if os.path.exists(output_file):
+        response = input(f"⚠️  {output_file} 已存在，是否覆盖? (y/n): ")
+        if response.lower() != 'y':
+            return False
+
+    # 创建临时目录
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # 加载断点续传状态
+    start_chunk = 0
+    total_dialogues = 0
+    if os.path.exists(resume_file):
+        try:
+            with open(resume_file, 'r') as f:
+                resume_data = json.load(f)
+            start_chunk = resume_data.get("processed_chunks", 0)
+            total_dialogues = resume_data.get("total_dialogues", 0)
+            print(f"🔄 从第 {start_chunk} 个chunk继续 (已处理 {total_dialogues:,} 个对话)")
+        except:
+            print("⚠️  resume文件损坏，从头开始")
+
+    def load_chunk_worker(chunk_info):
+        """工作线程：加载chunk"""
+        chunk_num, chunk_file = chunk_info
+        chunk_path = os.path.join(chunk_dir, chunk_file)
+        try:
+            data = torch.load(chunk_path, weights_only=True)
+            return chunk_num, data, len(data)
+        except Exception as e:
+            print(f"❌ 加载 {chunk_file} 失败: {e}")
+            return chunk_num, None, 0
+
+    def save_resume_state(processed_chunks, total_dialogues):
+        """保存断点续传状态"""
+        state = {
+            "processed_chunks": processed_chunks,
+            "total_dialogues": total_dialogues,
+            "timestamp": time.time()
+        }
+        with open(resume_file, 'w') as f:
+            json.dump(state, f)
+
+    # 分段处理
+    segment_count = 0
+    accumulated_data = []
+    processed_chunks = start_chunk
+
+    print(f"📊 处理参数: batch_size={batch_size}, save_interval={save_interval}, workers={max_workers}")
+
+    with tqdm(total=len(chunk_files), initial=start_chunk, desc=f"合并{data_type}") as pbar:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i in range(start_chunk, len(chunk_files), batch_size):
+                batch = chunk_files[i:i+batch_size]
+
+                # 提交加载任务
+                futures = [executor.submit(load_chunk_worker, chunk_info) for chunk_info in batch]
+
+                # 收集结果
+                batch_data = []
+                for future in futures:
+                    chunk_num, data, count = future.result()
+                    if data is not None:
+                        batch_data.extend(data)
+                        total_dialogues += count
+                        del data
+
+                # 累积数据
+                if batch_data:
+                    accumulated_data.extend(batch_data)
+                    del batch_data
+                    gc.collect()
+
+                processed_chunks += len(batch)
+                pbar.update(len(batch))
+
+                # 定期保存分段文件
+                if len(accumulated_data) >= save_interval * 20000 or processed_chunks >= len(chunk_files):
+                    if accumulated_data:
+                        segment_file = os.path.join(temp_dir, f"segment_{segment_count:04d}.pt")
+                        torch.save(accumulated_data, segment_file)
+                        print(f"💾 保存分段 {segment_count}: {len(accumulated_data):,} 个对话")
+
+                        del accumulated_data
+                        accumulated_data = []
+                        segment_count += 1
+                        gc.collect()
+
+                # 保存断点续传状态
+                save_resume_state(processed_chunks, total_dialogues)
+
+    # 合并所有分段文件
+    print(f"\n🔗 合并 {segment_count} 个分段文件...")
+    final_data = []
+
+    for i in range(segment_count):
+        segment_file = os.path.join(temp_dir, f"segment_{i:04d}.pt")
+        if os.path.exists(segment_file):
+            segment_data = torch.load(segment_file, weights_only=True)
+            final_data.extend(segment_data)
+            del segment_data
+            gc.collect()
+            print(f"✅ 合并分段 {i+1}/{segment_count}")
+
+    # 保存最终文件
+    print(f"💾 保存最终文件...")
+    torch.save(final_data, output_file)
+
+    # 清理临时文件
+    print(f"🧹 清理临时文件...")
+    import shutil
+    shutil.rmtree(temp_dir)
+    if os.path.exists(resume_file):
+        os.remove(resume_file)
+
+    # 验证
+    file_size = os.path.getsize(output_file) / (1024**3)
+    print(f"✅ {data_type}.pt 保存成功")
+    print(f"📊 总对话数: {total_dialogues:,}")
+    print(f"📊 文件大小: {file_size:.2f} GB")
+
     return True
 
 def merge_chunks_large_files(data_type, timeout_seconds=300):
@@ -336,11 +474,13 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="数据合并工具")
-    parser.add_argument("--method", choices=["simple", "optimized", "large"], 
+    parser.add_argument("--method", choices=["simple", "optimized", "large", "ultra"],
                        default="optimized", help="合并方法")
     parser.add_argument("--dataset", choices=["train", "valid", "test", "all"],
                        default="all", help="要合并的数据集")
     parser.add_argument("--workers", type=int, default=2, help="工作线程数")
+    parser.add_argument("--batch-size", type=int, default=20, help="批处理大小")
+    parser.add_argument("--save-interval", type=int, default=50, help="保存间隔(仅ultra方法)")
     parser.add_argument("--verify", action="store_true", help="验证合并结果")
     parser.add_argument("--cleanup", action="store_true", help="清理chunk文件")
     
@@ -358,12 +498,17 @@ def main():
     # 选择合并方法
     merge_func = {
         "simple": merge_chunks_simple,
-        "optimized": lambda dt: merge_chunks_optimized(dt, args.workers),
-        "large": merge_chunks_large_files
+        "optimized": lambda dt: merge_chunks_optimized(dt, args.workers, args.batch_size),
+        "large": merge_chunks_large_files,
+        "ultra": lambda dt: merge_chunks_ultra_optimized(dt, args.workers, args.batch_size, args.save_interval)
     }[args.method]
-    
+
     print(f"🔧 使用方法: {args.method}")
     print(f"📊 数据集: {datasets}")
+    if args.method in ["optimized", "ultra"]:
+        print(f"⚙️  参数: workers={args.workers}, batch_size={args.batch_size}")
+        if args.method == "ultra":
+            print(f"⚙️  保存间隔: {args.save_interval}")
     
     # 执行合并
     success_count = 0
