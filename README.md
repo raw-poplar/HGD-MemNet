@@ -171,11 +171,28 @@ pip install -r requirements.txt
 
 3.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
 
+    #### 方法1: 使用统一入口（推荐）
     ```bash
-    python -m src.prepare_binary_data
+    # 完整的数据处理流程
+    python -m src.data_processing.main --full-pipeline --workers=4
+
+    # 或者交互模式
+    python -m src.data_processing.main
     ```
 
-    运行完毕后，您的 `processed_data/` 目录下应该会看到 `train/`, `valid/`, `test/` 等子目录，其中包含了大量的 `chunk_*.pt` 文件和一个 `vocabulary.json`。
+    #### 方法2: 分步执行
+    ```bash
+    # 步骤1: 数据转换
+    python -m src.data_processing.prepare_binary_data --num_workers=4
+
+    # 步骤2: 数据合并
+    python -m src.data_processing.merge_tools --method=optimized --dataset=all
+
+    # 步骤3: 验证结果
+    python -m src.data_processing.merge_tools --verify
+    ```
+
+    运行完毕后，您的 `processed_data/` 目录下应该会看到 `train.pt`, `valid.pt`, `test.pt` 文件和一个 `vocabulary.json`。
 
 ### 4. 开始训练
 
