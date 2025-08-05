@@ -210,12 +210,41 @@ def merge_chunks_ultra_optimized(data_type, max_workers=2, batch_size=20, save_i
         except:
             print("⚠️  resume文件损坏，从头开始")
 
+    # 测试加载第一个文件
+    print(f"🧪 测试加载第一个chunk文件...")
+    test_chunk = chunk_files[start_chunk] if start_chunk < len(chunk_files) else chunk_files[0]
+    test_path = os.path.join(chunk_dir, test_chunk[1])
+    try:
+        print(f"🔄 测试加载: {test_chunk[1]}")
+        start_time = time.time()
+        test_data = torch.load(test_path, weights_only=True)
+        load_time = time.time() - start_time
+        print(f"✅ 测试成功! 加载时间: {load_time:.1f}秒, 数据量: {len(test_data):,}")
+        del test_data
+        gc.collect()
+    except Exception as e:
+        print(f"❌ 测试失败: {e}")
+        return False
+
+    return merge_chunks_ultra_optimized_impl(data_type, max_workers, batch_size, save_interval,
+                                           chunk_files, chunk_dir, output_file, temp_dir,
+                                           resume_file, start_chunk, total_dialogues)
+
+def merge_chunks_ultra_optimized_impl(data_type, max_workers, batch_size, save_interval,
+                                    chunk_files, chunk_dir, output_file, temp_dir,
+                                    resume_file, start_chunk, total_dialogues):
+    """实际的超级优化合并实现"""
+
     def load_chunk_worker(chunk_info):
         """工作线程：加载chunk"""
         chunk_num, chunk_file = chunk_info
         chunk_path = os.path.join(chunk_dir, chunk_file)
         try:
+            print(f"🔄 开始加载 {chunk_file}...")
+            start_time = time.time()
             data = torch.load(chunk_path, weights_only=True)
+            load_time = time.time() - start_time
+            print(f"✅ {chunk_file} 加载完成 ({load_time:.1f}秒, {len(data):,}个对话)")
             return chunk_num, data, len(data)
         except Exception as e:
             print(f"❌ 加载 {chunk_file} 失败: {e}")
@@ -238,26 +267,38 @@ def merge_chunks_ultra_optimized(data_type, max_workers=2, batch_size=20, save_i
 
     print(f"📊 处理参数: batch_size={batch_size}, save_interval={save_interval}, workers={max_workers}")
 
+    print(f"🔄 开始处理，从第 {start_chunk} 个chunk开始...")
+
     with tqdm(total=len(chunk_files), initial=start_chunk, desc=f"合并{data_type}") as pbar:
+        # 使用较小的实际批处理大小来避免I/O瓶颈
+        actual_batch_size = min(batch_size, max_workers * 2)
+        print(f"📊 实际批处理大小: {actual_batch_size}")
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i in range(start_chunk, len(chunk_files), batch_size):
-                batch = chunk_files[i:i+batch_size]
+            for i in range(start_chunk, len(chunk_files), actual_batch_size):
+                batch = chunk_files[i:i+actual_batch_size]
+                print(f"\n📦 处理批次 {i//actual_batch_size + 1}: chunk {i} 到 {min(i+actual_batch_size-1, len(chunk_files)-1)}")
 
                 # 提交加载任务
                 futures = [executor.submit(load_chunk_worker, chunk_info) for chunk_info in batch]
 
                 # 收集结果
                 batch_data = []
-                for future in futures:
-                    chunk_num, data, count = future.result()
-                    if data is not None:
-                        batch_data.extend(data)
-                        total_dialogues += count
-                        del data
+                for j, future in enumerate(futures):
+                    try:
+                        chunk_num, data, count = future.result(timeout=600)  # 10分钟超时
+                        if data is not None:
+                            batch_data.extend(data)
+                            total_dialogues += count
+                            del data
+                    except Exception as e:
+                        print(f"❌ 批次中第 {j+1} 个文件处理失败: {e}")
+                        continue
 
                 # 累积数据
                 if batch_data:
                     accumulated_data.extend(batch_data)
+                    print(f"📊 当前累积数据: {len(accumulated_data):,} 个对话")
                     del batch_data
                     gc.collect()
 
@@ -268,8 +309,9 @@ def merge_chunks_ultra_optimized(data_type, max_workers=2, batch_size=20, save_i
                 if len(accumulated_data) >= save_interval * 20000 or processed_chunks >= len(chunk_files):
                     if accumulated_data:
                         segment_file = os.path.join(temp_dir, f"segment_{segment_count:04d}.pt")
+                        print(f"💾 保存分段文件 {segment_count}...")
                         torch.save(accumulated_data, segment_file)
-                        print(f"💾 保存分段 {segment_count}: {len(accumulated_data):,} 个对话")
+                        print(f"✅ 分段 {segment_count} 保存完成: {len(accumulated_data):,} 个对话")
 
                         del accumulated_data
                         accumulated_data = []
@@ -278,6 +320,7 @@ def merge_chunks_ultra_optimized(data_type, max_workers=2, batch_size=20, save_i
 
                 # 保存断点续传状态
                 save_resume_state(processed_chunks, total_dialogues)
+                print(f"📊 进度: {processed_chunks}/{len(chunk_files)} chunks, {total_dialogues:,} 对话")
 
     # 合并所有分段文件
     print(f"\n🔗 合并 {segment_count} 个分段文件...")
