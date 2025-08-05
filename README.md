@@ -52,8 +52,8 @@ graph TB
     subgraph "静态神经组 (Static Neural Group)"
         direction TB
         subgraph "采样策略"
-            fixed_sample["固定采样<br/>(30%神经元)"]
-            random_sample["随机采样<br/>(5%神经元)<br/>可学习权重"]
+            fixed_sample["固定采样<br/>(30%固定的动态神经元)"]
+            random_sample["随机采样<br/>(5%随机的动态神经元)<br/>可学习权重"]
         end
 
         subgraph "决策与生成"
