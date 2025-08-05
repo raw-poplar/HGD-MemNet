@@ -11,76 +11,137 @@
 
 ## 模型架构
 
-为了更直观地理解 HGD-MemNet 的工作流程，下图展示了其核心组件之间的数据流：
+为了更直观地理解 HGD-MemNet 的工作流程，下图展示了其核心组件之间的数据流和分层门控机制：
 
 ```mermaid
-graph TD
-    %% --- Inputs ---
-    inp_xt["Input: x_t (Current Turn)"]
-    inp_xref["Input: x_ref (History)"]
-    inp_hprev["Input: h_prev (Previous State)"]
-    inp_tau["Input: temperature (Dynamic)"]  # 新增：温度输入
-
-    subgraph "Embedding Layer"
-        style EmbeddingLayer fill:#f9f9f9,stroke:#333,stroke-width:2px
-        embed_xt("Embedding")
-        embed_xref("Embedding")
+graph TB
+    %% 输入层
+    subgraph "输入层 (Input Layer)"
+        xt["x_t<br/>(当前轮次)"]
+        xref["x_ref<br/>(对话历史)"]
+        hprev["h_prev<br/>(前一状态)"]
+        temp["temperature<br/>(温度参数)"]
     end
 
-    inp_xt --> embed_xt
-    inp_xref --> embed_xref
-
-    subgraph "Dynamic Group (State Evolution & Contextualization)"
-        style DynamicGroup fill:#f9f9f9,stroke:#333,stroke-width:2px
-        embed_xref -- "Embedded History" --> D_Encoder["Encoder (GRU)"]
-        embed_xt -- "Embedded Current" --> D_xtEncoder["x_t Encoder (GRU)"]  # 新增：x_t编码器
-        D_Encoder -- "History<br/>Representation" --> D_Attention["Attention"]
-        inp_hprev -- "Query" --> D_Attention
-        D_Attention -- "Context Vector<br/>(attn_context)" --> D_CoreRNN["Core RNN<br/>(ReservoirRNNCell)"]
-        D_xtEncoder -- "Encoded x_t" --> D_CoreRNN
-        inp_hprev -- "Previous State" --> D_CoreRNN
-        inp_tau -- "Temperature" --> D_CoreRNN  # 新增：温度传入
-        D_CoreRNN -- "h_next" --> D_Norm["LayerNorm"]  # 新增：LayerNorm
-    end
-    
-    D_Norm -- "Normalized h_next" --> S_Head["Static Head"]
-    D_Attention -- "Context Vector" --> S_Head
-
-    subgraph "Static Head (Decision & Generation)"
-        style StaticHead fill:#f9f9f9,stroke:#333,stroke-width:2px
-        S_Head -- "Combined State" --> S_Gate["Gate Network"]
-        S_Head -- "Combined State" --> S_Output["Output Network"]
-        S_Head -- "Random Pool" --> S_Sampler["Learned Sampler (Linear + Softmax)"]  # 新增：可学习采样
+    %% 嵌入层
+    subgraph "嵌入层 (Embedding Layer)"
+        emb_xt["Embedding(x_t)"]
+        emb_xref["Embedding(x_ref)"]
     end
 
-    subgraph "Outputs"
-        style Outputs fill:#e6ffed,stroke:#2e7d32,stroke-width:2px
-        D_Norm -- "h_next" --> out_hnext_final["h_next (Next State)"]
-        S_Gate --> out_gate["gate_pred (Decision)"]
-        S_Output --> out_logits["output_logits (Response)"]
+    %% 动态神经组
+    subgraph "动态神经组 (Dynamic Neural Group)"
+        direction TB
+        subgraph "编码器组"
+            gru_ref["历史编码器<br/>(GRU)"]
+            gru_xt["当前编码器<br/>(GRU)"]
+        end
+
+        subgraph "注意力机制"
+            attn["Attention<br/>(Bahdanau)"]
+        end
+
+        subgraph "核心思考单元"
+            reservoir["可训练蓄水池RNN<br/>(ReservoirRNNCell)<br/>神经元两两相连<br/>权重可学习<br/>温度控制"]
+        end
+
+        layernorm["LayerNorm<br/>(标准化)"]
     end
 
-    classDef input fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
-    class inp_xt,inp_xref,inp_hprev,inp_tau input;
+    %% 静态神经组
+    subgraph "静态神经组 (Static Neural Group)"
+        direction TB
+        subgraph "采样策略"
+            fixed_sample["固定采样<br/>(30%神经元)"]
+            random_sample["随机采样<br/>(5%神经元)<br/>可学习权重"]
+        end
+
+        subgraph "决策与生成"
+            gate_net["门控网络<br/>(Gate Network)<br/>决定是否输出"]
+            output_net["输出网络<br/>(Output Network)<br/>生成回应"]
+        end
+    end
+
+    %% 输出层
+    subgraph "输出层 (Output Layer)"
+        h_next["h_next<br/>(下一状态)"]
+        gate_pred["gate_pred<br/>(门控决策)"]
+        response["output_logits<br/>(回应生成)"]
+    end
+
+    %% 连接关系
+    xt --> emb_xt
+    xref --> emb_xref
+
+    emb_xref --> gru_ref
+    emb_xt --> gru_xt
+    hprev --> attn
+    gru_ref --> attn
+
+    attn --> reservoir
+    gru_xt --> reservoir
+    hprev --> reservoir
+    temp --> reservoir
+
+    reservoir --> layernorm
+
+    layernorm --> fixed_sample
+    layernorm --> random_sample
+    layernorm --> h_next
+
+    fixed_sample --> gate_net
+    random_sample --> gate_net
+    attn --> gate_net
+
+    fixed_sample --> output_net
+    random_sample --> output_net
+    attn --> output_net
+
+    gate_net --> gate_pred
+    output_net --> response
+
+    %% 样式定义
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000
+    classDef dynamicStyle fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef staticStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    classDef outputStyle fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px,color:#000
+    classDef coreStyle fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+
+    class xt,xref,hprev,temp inputStyle
+    class emb_xt,emb_xref,gru_ref,gru_xt,attn,layernorm dynamicStyle
+    class reservoir coreStyle
+    class fixed_sample,random_sample,gate_net,output_net staticStyle
+    class h_next,gate_pred,response outputStyle
 ```
 
 ## 项目结构
 
 ```
-HGD-MemNet_for_GitHub/
+HGD-MemNet/
 ├── .gitignore
 ├── LICENSE
 ├── README.md
 ├── config.py                 # 统一的配置文件 (学习率, 路径, 模型维度等)
 ├── requirements.txt          # 项目依赖
-└── src/
-    ├── model.py              # HGD_MemNet 模型的核心定义
-    ├── dataset.py            # 高效的二进制数据集加载器 BinaryDialogueDataset
-    ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
-    ├── train.py              # 主训练脚本
-    ├── evaluate.py           # 模型评估脚本
-    ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
-    └── ...
+├── 新的想法.txt              # 模型优化思路和创新想法
+├── src/
+│   ├── model.py              # HGD_MemNet 模型的核心定义
+│   ├── dataset.py            # 高效的二进制数据集加载器 BinaryDialogueDataset
+│   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
+│   ├── train.py              # 主训练脚本
+│   ├── evaluate.py           # 模型评估脚本
+│   ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
+│   ├── chat_web.py           # Web界面聊天脚本
+│   ├── utils.py              # 工具函数
+│   └── tests/                # 测试套件
+│       ├── test_model.py     # 模型测试
+│       ├── test_training.py  # 训练测试
+│       └── ...               # 其他测试文件
+└── 辅助脚本/
+    ├── check_partial.py      # 检查部分文件
+    ├── cleanup_partial_files.py  # 清理部分文件
+    ├── count_processed_dialogues.py  # 统计处理的对话数量
+    └── quick_count.py        # 快速计数
 ```
 
 ## 环境设置与使用指南
@@ -89,7 +150,7 @@ HGD-MemNet_for_GitHub/
 
 ```bash
 git clone <你的仓库URL>
-cd HGD-MemNet_for_GitHub
+cd HGD-MemNet
 ```
 
 ### 2. 安装依赖
