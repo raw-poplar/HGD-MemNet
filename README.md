@@ -127,12 +127,20 @@ HGD-MemNet/
 ├── src/
 │   ├── model.py              # HGD_MemNet 模型的核心定义
 │   ├── dataset.py            # 高效的二进制数据集加载器 BinaryDialogueDataset
-│   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
 │   ├── train.py              # 主训练脚本
 │   ├── evaluate.py           # 模型评估脚本
 │   ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
 │   ├── chat_web.py           # Web界面聊天脚本
 │   ├── utils.py              # 工具函数
+│   ├── data_processing/      # 数据处理模块
+│   │   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
+│   │   ├── merge_tools.py    # 数据合并工具
+│   │   ├── data_utils.py     # 数据处理工具函数
+│   │   ├── debug_tools.py    # 调试和检查工具
+│   │   └── vocabulary/       # 词汇表构建工具
+│   │       ├── build_vocabulary.py      # 词汇表构建核心模块
+│   │       ├── build_vocab_quick.py     # 快速启动脚本
+│   │       └── test_vocabulary_builder.py  # 测试脚本
 │   └── tests/                # 测试套件
 │       ├── test_model.py     # 模型测试
 │       ├── test_training.py  # 训练测试
@@ -169,7 +177,19 @@ pip install -r requirements.txt
     *   `RAW_DATA_DIR`: 指向您存放原始数据的地方 (例如 `'raw_data/'`)。
     *   `LCCC_PROCESSED_PATH`: 指向您希望存放预处理后的二进制数据的目录 (例如 `'processed_data/'`)。
 
-3.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
+3.  **构建词汇表**: 首先需要从数据中构建词汇表
+    ```bash
+    # 快速构建词汇表（推荐）
+    python -m src.data_processing.vocabulary.build_vocab_quick
+
+    # 或者自定义参数
+    python -m src.data_processing.vocabulary.build_vocabulary --vocab_size 30000 --min_freq 2
+
+    # 测试词汇表构建工具
+    python -m src.data_processing.vocabulary.test_vocabulary_builder
+    ```
+
+4.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
 
     #### 方法1: 使用统一入口（推荐）
     ```bash
@@ -223,6 +243,55 @@ python -m src.chat  # 命令行交互
 # 或者使用 Web 接口：
 streamlit run src/chat_web.py  # Web 演示
 ```
+
+## 词汇表构建工具
+
+项目包含了一套完整的词汇表构建工具，用于从JSONL格式的对话数据中提取最常用的词汇。
+
+### 主要功能
+
+- **中文分词支持**: 使用jieba进行中文分词
+- **词频统计**: 统计所有词汇的出现频率并过滤低频词
+- **灵活配置**: 支持自定义词汇表大小、最小词频等参数
+- **智能过滤**: 自动过滤标点符号，保留中文、英文和数字
+- **详细统计**: 生成词频分布和使用统计报告
+
+### 快速使用
+
+**注意**: 使用前请先在 `config.py` 中配置正确的数据路径，或设置环境变量 `DATASET_PATH`
+
+```bash
+# 安装依赖
+pip install jieba
+
+# 快速构建词汇表（使用config.py中的配置）
+python -m src.data_processing.vocabulary.build_vocab_quick
+
+# 自定义参数构建
+python -m src.data_processing.vocabulary.build_vocabulary \
+    --data_path "你的数据路径" \
+    --vocab_size 30000 \
+    --min_freq 2
+
+# 测试工具
+python -m src.data_processing.vocabulary.test_vocabulary_builder
+```
+
+### 输入要求
+
+工具需要以下三个JSONL文件：
+- `train.jsonl` - 训练数据
+- `valid.jsonl` - 验证数据
+- `test.jsonl` - 测试数据
+
+每行格式：`[{"text": "你好"}, {"text": "你好吗"}]`
+
+### 输出文件
+
+- `vocabulary.json` - 完整词汇表文件，包含词汇映射和统计信息
+- `vocabulary_stats.json` - 详细的词频分布统计
+
+更多技术细节请参考 `src/data_processing/README.md` 中的词汇表构建部分
 
 ## 改进与优化
 
