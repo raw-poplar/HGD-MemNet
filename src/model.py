@@ -41,6 +41,107 @@ class Attention(nn.Module):
         return context, attn_weights
 
 
+class MultiHeadAttention(nn.Module):
+    """
+    多头注意力机制
+    """
+    def __init__(self, hidden_dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        # 线性变换层
+        self.W_q = nn.Linear(hidden_dim, hidden_dim)
+        self.W_k = nn.Linear(hidden_dim, hidden_dim)
+        self.W_v = nn.Linear(hidden_dim, hidden_dim)
+        self.W_o = nn.Linear(hidden_dim, hidden_dim)
+
+        # 缩放因子
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, query, keys):
+        """
+        Args:
+            query (torch.Tensor): 查询向量, shape: (batch_size, hidden_dim)
+            keys (torch.Tensor): 键值向量, shape: (batch_size, seq_len, hidden_dim)
+
+        Returns:
+            context (torch.Tensor): 上下文向量, shape: (batch_size, hidden_dim)
+            attn_weights (torch.Tensor): 注意力权重, shape: (batch_size, num_heads, seq_len)
+        """
+        batch_size, seq_len, _ = keys.shape
+
+        # 线性变换
+        Q = self.W_q(query.unsqueeze(1))  # (batch_size, 1, hidden_dim)
+        K = self.W_k(keys)  # (batch_size, seq_len, hidden_dim)
+        V = self.W_v(keys)  # (batch_size, seq_len, hidden_dim)
+
+        # 重塑为多头形式
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, 1, head_dim)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
+
+        # 计算注意力分数
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (batch_size, num_heads, 1, seq_len)
+        attn_weights = F.softmax(scores, dim=-1)  # (batch_size, num_heads, 1, seq_len)
+
+        # 应用注意力权重
+        context = torch.matmul(attn_weights, V)  # (batch_size, num_heads, 1, head_dim)
+
+        # 合并多头
+        context = context.transpose(1, 2).contiguous().view(batch_size, 1, self.hidden_dim)  # (batch_size, 1, hidden_dim)
+        context = context.squeeze(1)  # (batch_size, hidden_dim)
+
+        # 输出投影
+        context = self.W_o(context)
+
+        # 返回平均注意力权重用于可视化
+        attn_weights = attn_weights.squeeze(2).mean(dim=1)  # (batch_size, seq_len)
+
+        return context, attn_weights
+
+
+class AttentionModule(nn.Module):
+    """
+    可配置的注意力模块，根据config.ATTENTION_HEADS选择不同的注意力机制
+    """
+    def __init__(self, hidden_dim):
+        super(AttentionModule, self).__init__()
+        self.attention_heads = config.ATTENTION_HEADS
+
+        if self.attention_heads == 0:
+            # 无注意力机制，使用简单的平均池化
+            self.attention = None
+        elif self.attention_heads == 1:
+            # 单头注意力（Bahdanau注意力）
+            self.attention = Attention(hidden_dim)
+        else:
+            # 多头注意力
+            self.attention = MultiHeadAttention(hidden_dim, self.attention_heads)
+
+    def forward(self, query, keys):
+        """
+        Args:
+            query (torch.Tensor): 查询向量, shape: (batch_size, hidden_dim)
+            keys (torch.Tensor): 键值向量, shape: (batch_size, seq_len, hidden_dim)
+
+        Returns:
+            context (torch.Tensor): 上下文向量, shape: (batch_size, hidden_dim)
+            attn_weights (torch.Tensor): 注意力权重, shape: (batch_size, seq_len) 或 None
+        """
+        if self.attention_heads == 0:
+            # 纯HGD-MemNet架构：使用平均池化作为上下文
+            context = keys.mean(dim=1)  # (batch_size, hidden_dim)
+            attn_weights = None
+            return context, attn_weights
+        else:
+            # 使用配置的注意力机制
+            return self.attention(query, keys)
+
+
 # --- 新: 可训练的“蓄水池”式RNN单元 ---
 class ReservoirRNNCell(nn.Module):
     def __init__(self, input_size, hidden_size, initial_temperature=1.0, use_hard_sampling=False):
@@ -144,8 +245,8 @@ class DynamicGroup(nn.Module):
         self.encoder_rnn = nn.GRU(embed_dim, hidden_dim, batch_first=True)
         self.x_t_encoder = nn.GRU(embed_dim, hidden_dim, batch_first=True)  # 新增：x_t的独立GRU编码器
         
-        # 注意力模块 (保持不变)
-        self.attention = Attention(hidden_dim)
+        # 注意力模块 (使用可配置的注意力机制)
+        self.attention = AttentionModule(hidden_dim)
 
         # 核心演化RNN: 被替换为新的可训练“蓄水池”单元
         self.core_rnn = ReservoirRNNCell(hidden_dim + hidden_dim, hidden_dim)  # 更新输入大小：x_t_encoded + attn_context
@@ -401,11 +502,49 @@ if __name__ == '__main__':
     assert h_next_test.shape == (batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM)
     assert gate_pred_test.shape == (batch_size, 1)
     assert output_logits_test.shape == (batch_size, config.VOCAB_SIZE)
-    print("\nHGD_MemNet 维度检查通过！") 
+    print("\nHGD_MemNet 维度检查通过！")
+
+    # --- 测试不同注意力配置 ---
+    print("\n--- 测试不同注意力配置 ---")
+
+    # 保存原始配置
+    original_attention_heads = config.ATTENTION_HEADS
+
+    # 测试配置列表
+    test_configs = [0, 1, 4, 8]
+
+    for heads in test_configs:
+        print(f"\n测试 ATTENTION_HEADS = {heads}")
+        config.ATTENTION_HEADS = heads
+
+        # 创建新模型
+        test_model = HGD_MemNet(
+            vocab_size=config.VOCAB_SIZE,
+            embed_dim=config.EMBEDDING_DIM,
+            dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
+            static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
+        ).to("cpu")
+
+        # 测试前向传播
+        try:
+            h_next_test, gate_pred_test, output_logits_test = test_model(x_t_test, x_ref_test, h_prev_test)
+            print(f"   配置 {heads} 头注意力: 成功")
+            print(f"   输出形状: h_next={h_next_test.shape}, gate={gate_pred_test.shape}, logits={output_logits_test.shape}")
+        except Exception as e:
+            print(f"   配置 {heads} 头注意力: 失败 - {e}")
+
+    # 恢复原始配置
+    config.ATTENTION_HEADS = original_attention_heads
+    print(f"\n恢复原始配置: ATTENTION_HEADS = {original_attention_heads}")
 
     # 新: 测试高级RNN cell
-    rnn_cell = ReservoirRNNCell(hidden_dim + hidden_dim, hidden_dim, initial_temperature=1.5, use_hard_sampling=True)  # 更新输入大小
-    h_next_test = rnn_cell(x_t_embed.squeeze(1), h_prev, temperature=0.5)  # 测试动态温度
+    rnn_input_size = hidden_dim + hidden_dim  # x_t_encoded + attention_context
+    rnn_cell = ReservoirRNNCell(rnn_input_size, hidden_dim, initial_temperature=1.5, use_hard_sampling=True)
+    # 创建正确维度的输入：拼接x_t_encoded和attention_context
+    x_t_encoded = torch.randn(batch_size, hidden_dim)  # 模拟编码后的x_t
+    attention_context = torch.randn(batch_size, hidden_dim)  # 模拟注意力上下文
+    test_input = torch.cat([x_t_encoded, attention_context], dim=1)  # (batch_size, hidden_dim + hidden_dim)
+    h_next_test = rnn_cell(test_input, h_prev, temperature=0.5)  # 测试动态温度
     print(f'高级RNN cell 输出形状: {h_next_test.shape}')
     assert h_next_test.shape == (batch_size, hidden_dim)
     print('高级RNN cell 测试通过！')

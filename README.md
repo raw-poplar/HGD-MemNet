@@ -145,6 +145,8 @@ HGD-MemNet/
 │       ├── test_model.py     # 模型测试
 │       ├── test_training.py  # 训练测试
 │       └── ...               # 其他测试文件
+├── examples/                 # 示例和演示脚本
+│   └── attention_config_demo.py  # 注意力机制配置演示
 └── 辅助脚本/
     ├── check_partial.py      # 检查部分文件
     ├── cleanup_partial_files.py  # 清理部分文件
@@ -214,7 +216,27 @@ pip install -r requirements.txt
 
     运行完毕后，您的 `processed_data/` 目录下应该会看到 `train.pt`, `valid.pt`, `test.pt` 文件和一个 `vocabulary.json`。
 
-### 4. 开始训练
+### 4. 配置注意力机制（可选）
+
+在开始训练前，您可以根据需要配置注意力机制。在 `config.py` 中修改 `ATTENTION_HEADS` 参数：
+
+```python
+# 在 config.py 中设置
+ATTENTION_HEADS = 8  # 可选值: 0, 1, 或任意正整数
+
+# 配置说明:
+# 0: 纯HGD-MemNet架构（无注意力，计算效率最高）
+# 1: 单头注意力（Bahdanau注意力，平衡性能和效率）
+# >1: 多头注意力（现代Transformer风格，性能最佳）
+```
+
+您也可以运行演示脚本来测试不同配置：
+
+```bash
+python examples/attention_config_demo.py
+```
+
+### 5. 开始训练
 
 直接运行训练脚本即可。脚本会自动从 `config.py` 中配置的检查点目录加载最新的检查点，并继续训练。
 
@@ -225,7 +247,7 @@ python -m src.train
 *   训练日志、验证损失和检查点会保存在 `config.CHECKPOINT_DIR` 指定的目录中。
 *   表现最好的模型会被额外保存到 `config.BEST_MODEL_DIR`。
 
-### 5. 评估模型
+### 6. 评估模型
 
 运行评估脚本来测试模型在测试集上的性能。
 
@@ -233,7 +255,7 @@ python -m src.train
 python -m src.evaluate
 ```
 
-### 6. 与模型聊天
+### 7. 与模型聊天
 
 使用 `chat.py` 脚本与您训练好的最佳模型进行交互。
 
@@ -297,6 +319,10 @@ python -m src.data_processing.vocabulary.test_vocabulary_builder
 
 - **训练优化**：实现了温度退火（从高到低衰减）和硬/软采样切换，以提升探索性和稳定性。
 - **架构增强**：添加了 x_t 的独立编码器、可学习采样权重和 LayerNorm，以提高模型鲁棒性和效率。
+- **可配置注意力机制**：支持三种注意力模式，可在 `config.py` 中通过 `ATTENTION_HEADS` 参数配置：
+  - `ATTENTION_HEADS = 0`：纯HGD-MemNet架构，使用平均池化替代注意力机制
+  - `ATTENTION_HEADS = 1`：单头注意力机制（Bahdanau注意力）
+  - `ATTENTION_HEADS > 1`：多头注意力机制，默认为8头
 - **建议**：监控温度参数，实验不同衰减率；对于大模型，考虑分布式训练。
 
 ## 原创性声明
