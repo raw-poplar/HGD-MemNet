@@ -157,7 +157,7 @@ HGD-MemNet/
 ### 1. 克隆仓库
 
 ```bash
-git clone <你的仓库URL>
+git clone https://github.com/raw-poplar/HGD-MemNet.git
 cd HGD-MemNet
 ```
 
