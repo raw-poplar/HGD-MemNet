@@ -12,7 +12,12 @@ src/data_processing/
 ├── merge_tools.py                 # 数据合并工具集合
 ├── data_utils.py                  # 数据处理工具函数
 ├── debug_tools.py                 # 调试和检查工具
-└── legacy_merge_scripts.py        # 遗留合并脚本（备用）
+├── legacy_merge_scripts.py        # 遗留合并脚本（备用）
+└── vocabulary/                    # 词汇表构建工具
+    ├── __init__.py                # 词汇表模块初始化
+    ├── build_vocabulary.py        # 词汇表构建核心模块
+    ├── build_vocab_quick.py       # 快速启动脚本
+    └── test_vocabulary_builder.py # 测试脚本
 ```
 
 ## 🚀 主要功能
@@ -108,7 +113,41 @@ python -m src.data_processing.debug_tools --test-loading --dataset=valid
 python -m src.data_processing.debug_tools --benchmark --dataset=train
 ```
 
-## 📋 完整处理流程
+### 5. 词汇表构建 (`vocabulary/`)
+
+从JSONL格式的对话数据中构建词汇表。
+
+**特性**:
+- 中文分词支持（jieba）
+- 词频统计和过滤
+- 可配置词汇表大小
+- 智能文本预处理
+- 详细统计报告
+
+**使用方法**:
+```bash
+# 快速构建（推荐）
+python -m src.data_processing.vocabulary.build_vocab_quick
+
+# 自定义参数
+python -m src.data_processing.vocabulary.build_vocabulary \
+    --vocab_size 30000 --min_freq 2
+
+# 测试工具
+python -m src.data_processing.vocabulary.test_vocabulary_builder
+```
+
+**输出文件**:
+- `vocabulary.json` - 词汇表文件
+- `vocabulary_stats.json` - 统计信息
+
+## 完整处理流程
+
+### 步骤0: 构建词汇表（必需）
+```bash
+# 首先构建词汇表
+python -m src.data_processing.vocabulary.build_vocab_quick
+```
 
 ### 步骤1: 数据转换
 ```bash

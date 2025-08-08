@@ -27,14 +27,16 @@ from .prepare_binary_data import convert_to_binary, process_dialogue_to_tensors
 from .merge_tools import merge_chunks_optimized, verify_merged_files
 from .data_utils import check_data_integrity, estimate_processing_time
 from .debug_tools import test_chunk_loading, analyze_processing_status
+from .vocabulary import VocabularyBuilder
 
 __all__ = [
     'convert_to_binary',
-    'process_dialogue_to_tensors', 
+    'process_dialogue_to_tensors',
     'merge_chunks_optimized',
     'verify_merged_files',
     'check_data_integrity',
     'estimate_processing_time',
     'test_chunk_loading',
-    'analyze_processing_status'
+    'analyze_processing_status',
+    'VocabularyBuilder'
 ]

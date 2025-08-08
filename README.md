@@ -127,16 +127,26 @@ HGD-MemNet/
 ├── src/
 │   ├── model.py              # HGD_MemNet 模型的核心定义
 │   ├── dataset.py            # 高效的二进制数据集加载器 BinaryDialogueDataset
-│   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
 │   ├── train.py              # 主训练脚本
 │   ├── evaluate.py           # 模型评估脚本
 │   ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
 │   ├── chat_web.py           # Web界面聊天脚本
 │   ├── utils.py              # 工具函数
+│   ├── data_processing/      # 数据处理模块
+│   │   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
+│   │   ├── merge_tools.py    # 数据合并工具
+│   │   ├── data_utils.py     # 数据处理工具函数
+│   │   ├── debug_tools.py    # 调试和检查工具
+│   │   └── vocabulary/       # 词汇表构建工具
+│   │       ├── build_vocabulary.py      # 词汇表构建核心模块
+│   │       ├── build_vocab_quick.py     # 快速启动脚本
+│   │       └── test_vocabulary_builder.py  # 测试脚本
 │   └── tests/                # 测试套件
 │       ├── test_model.py     # 模型测试
 │       ├── test_training.py  # 训练测试
 │       └── ...               # 其他测试文件
+├── examples/                 # 示例和演示脚本
+│   └── attention_config_demo.py  # 注意力机制配置演示
 └── 辅助脚本/
     ├── check_partial.py      # 检查部分文件
     ├── cleanup_partial_files.py  # 清理部分文件
@@ -169,7 +179,19 @@ pip install -r requirements.txt
     *   `RAW_DATA_DIR`: 指向您存放原始数据的地方 (例如 `'raw_data/'`)。
     *   `LCCC_PROCESSED_PATH`: 指向您希望存放预处理后的二进制数据的目录 (例如 `'processed_data/'`)。
 
-3.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
+3.  **构建词汇表**: 首先需要从数据中构建词汇表
+    ```bash
+    # 快速构建词汇表（推荐）
+    python -m src.data_processing.vocabulary.build_vocab_quick
+
+    # 或者自定义参数
+    python -m src.data_processing.vocabulary.build_vocabulary --vocab_size 30000 --min_freq 2
+
+    # 测试词汇表构建工具
+    python -m src.data_processing.vocabulary.test_vocabulary_builder
+    ```
+
+4.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
 
     #### 方法1: 使用统一入口（推荐）
     ```bash
@@ -194,7 +216,27 @@ pip install -r requirements.txt
 
     运行完毕后，您的 `processed_data/` 目录下应该会看到 `train.pt`, `valid.pt`, `test.pt` 文件和一个 `vocabulary.json`。
 
-### 4. 开始训练
+### 4. 配置注意力机制（可选）
+
+在开始训练前，您可以根据需要配置注意力机制。在 `config.py` 中修改 `ATTENTION_HEADS` 参数：
+
+```python
+# 在 config.py 中设置
+ATTENTION_HEADS = 8  # 可选值: 0, 1, 或任意正整数
+
+# 配置说明:
+# 0: 纯HGD-MemNet架构（无注意力，计算效率最高）
+# 1: 单头注意力（Bahdanau注意力，平衡性能和效率）
+# >1: 多头注意力（现代Transformer风格，性能最佳）
+```
+
+您也可以运行演示脚本来测试不同配置：
+
+```bash
+python examples/attention_config_demo.py
+```
+
+### 5. 开始训练
 
 直接运行训练脚本即可。脚本会自动从 `config.py` 中配置的检查点目录加载最新的检查点，并继续训练。
 
@@ -205,7 +247,7 @@ python -m src.train
 *   训练日志、验证损失和检查点会保存在 `config.CHECKPOINT_DIR` 指定的目录中。
 *   表现最好的模型会被额外保存到 `config.BEST_MODEL_DIR`。
 
-### 5. 评估模型
+### 6. 评估模型
 
 运行评估脚本来测试模型在测试集上的性能。
 
@@ -213,7 +255,7 @@ python -m src.train
 python -m src.evaluate
 ```
 
-### 6. 与模型聊天
+### 7. 与模型聊天
 
 使用 `chat.py` 脚本与您训练好的最佳模型进行交互。
 
@@ -224,10 +266,63 @@ python -m src.chat  # 命令行交互
 streamlit run src/chat_web.py  # Web 演示
 ```
 
+## 词汇表构建工具
+
+项目包含了一套完整的词汇表构建工具，用于从JSONL格式的对话数据中提取最常用的词汇。
+
+### 主要功能
+
+- **中文分词支持**: 使用jieba进行中文分词
+- **词频统计**: 统计所有词汇的出现频率并过滤低频词
+- **灵活配置**: 支持自定义词汇表大小、最小词频等参数
+- **智能过滤**: 自动过滤标点符号，保留中文、英文和数字
+- **详细统计**: 生成词频分布和使用统计报告
+
+### 快速使用
+
+**注意**: 使用前请先在 `config.py` 中配置正确的数据路径，或设置环境变量 `DATASET_PATH`
+
+```bash
+# 安装依赖
+pip install jieba
+
+# 快速构建词汇表（使用config.py中的配置）
+python -m src.data_processing.vocabulary.build_vocab_quick
+
+# 自定义参数构建
+python -m src.data_processing.vocabulary.build_vocabulary \
+    --data_path "你的数据路径" \
+    --vocab_size 30000 \
+    --min_freq 2
+
+# 测试工具
+python -m src.data_processing.vocabulary.test_vocabulary_builder
+```
+
+### 输入要求
+
+工具需要以下三个JSONL文件：
+- `train.jsonl` - 训练数据
+- `valid.jsonl` - 验证数据
+- `test.jsonl` - 测试数据
+
+每行格式：`[{"text": "你好"}, {"text": "你好吗"}]`
+
+### 输出文件
+
+- `vocabulary.json` - 完整词汇表文件，包含词汇映射和统计信息
+- `vocabulary_stats.json` - 详细的词频分布统计
+
+更多技术细节请参考 `src/data_processing/README.md` 中的词汇表构建部分
+
 ## 改进与优化
 
 - **训练优化**：实现了温度退火（从高到低衰减）和硬/软采样切换，以提升探索性和稳定性。
 - **架构增强**：添加了 x_t 的独立编码器、可学习采样权重和 LayerNorm，以提高模型鲁棒性和效率。
+- **可配置注意力机制**：支持三种注意力模式，可在 `config.py` 中通过 `ATTENTION_HEADS` 参数配置：
+  - `ATTENTION_HEADS = 0`：纯HGD-MemNet架构，使用平均池化替代注意力机制
+  - `ATTENTION_HEADS = 1`：单头注意力机制（Bahdanau注意力）
+  - `ATTENTION_HEADS > 1`：多头注意力机制，默认为8头
 - **建议**：监控温度参数，实验不同衰减率；对于大模型，考虑分布式训练。
 
 ## 原创性声明
