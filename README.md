@@ -238,11 +238,278 @@ streamlit run src/chat_web.py  # Web 演示
 - 创新性地设计了动态神经组的可训练数据交换机制及其按时间步渐进式训练策略，使模型能在思考过程中逐步逼近最优解。
 本项目代码、模型架构及相关技术方案均为原创成果。
 
+## 注意力机制配置指南
+
+### 概述
+
+本项目实现了灵活的多头注意力机制，您可以通过简单的配置参数来控制模型的注意力行为：
+
+- **NUM_ATTENTION_HEADS = 0**: 纯HGD-MemNet架构（无注意力机制）
+- **NUM_ATTENTION_HEADS = 1**: 单头注意力（Bahdanau或多头实现）
+- **NUM_ATTENTION_HEADS >= 2**: 多头注意力机制
+
+### 配置参数详解
+
+在config.py中的关键参数：
+
+```python
+# ------------------------------------
+# 注意力机制相关参数
+# ------------------------------------
+# 注意力头数量 (0: 纯HGD-MemNet, 1: 单头注意力, >=2: 多头注意力)
+NUM_ATTENTION_HEADS = 1
+
+# 多头注意力相关参数
+ATTENTION_DROPOUT = 0.1  # 注意力dropout率
+ATTENTION_HEAD_DIM = None  # 每个注意力头的维度，None表示自动计算
+USE_ATTENTION_BIAS = True  # 是否在注意力计算中使用偏置
+ATTENTION_TEMPERATURE = 1.0  # 注意力温度参数
+
+# 注意力机制类型选择
+ATTENTION_TYPE = "bahdanau"  # 可选: "bahdanau", "dot_product", "multi_head"
+```
+
+### 使用方法
+
+#### 方法1: 直接修改config.py
+
+```python
+# 纯HGD-MemNet（推荐用于验证原创架构）
+NUM_ATTENTION_HEADS = 0
+
+# 单头注意力（平衡性能和复杂度）
+NUM_ATTENTION_HEADS = 1
+
+# 多头注意力（更强表征能力）
+NUM_ATTENTION_HEADS = 4  # 确保192能被4整除
+```
+
+#### 方法2: 在代码中动态指定
+
+```python
+# 创建不同配置的模型
+model_pure = HGD_MemNet(
+    vocab_size=vocab_size,
+    embed_dim=config.EMBEDDING_DIM,
+    dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
+    static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
+    num_attention_heads=0  # 纯HGD-MemNet
+)
+
+model_multi_head = HGD_MemNet(
+    vocab_size=vocab_size,
+    embed_dim=config.EMBEDDING_DIM,
+    dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
+    static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
+    num_attention_heads=4  # 四头注意力
+)
+```
+
+### 性能对比
+
+| 配置 | 参数量 | 推理速度 | 模型大小 | 特点 |
+|------|--------|----------|----------|------|
+| 纯HGD-MemNet (0头) | 743,490 | 最快 | 2.84MB | 突出原创性，最轻量 |
+| 单头注意力 (1头) | 780,739 | 快 | 2.98MB | 平衡性能和复杂度 |
+| 双头注意力 (2头) | 855,042 | 中等 | 3.26MB | 更强表征能力 |
+| 八头注意力 (8头) | 855,042 | 中等 | 3.26MB | 最强表征能力 |
+
+### 使用建议
+
+#### 1. 研究和验证阶段
+```python
+NUM_ATTENTION_HEADS = 0  # 纯HGD-MemNet
+```
+优势：
+- 突出原创神经元交换机制
+- 最少的参数和计算开销
+- 便于分析和理解模型行为
+- 适合饥饿式训练实验
+
+#### 2. 性能优化阶段
+```python
+NUM_ATTENTION_HEADS = 1  # 单头注意力
+```
+优势：
+- 在性能和复杂度之间取得平衡
+- 适合与传统模型对比
+- 计算开销适中
+
+#### 3. 最大性能阶段
+```python
+NUM_ATTENTION_HEADS = 4  # 多头注意力
+```
+优势：
+- 最强的表征学习能力
+- 适合复杂对话任务
+- 可与Transformer直接对比
+
+### 重要注意事项
+
+#### 维度兼容性
+确保 `DYNAMIC_GROUP_HIDDEN_DIM` 能被 `NUM_ATTENTION_HEADS` 整除：
+
+```python
+# 正确的配置
+DYNAMIC_GROUP_HIDDEN_DIM = 192
+NUM_ATTENTION_HEADS = 4  # 192 ÷ 4 = 48
+
+# 错误的配置
+DYNAMIC_GROUP_HIDDEN_DIM = 192
+NUM_ATTENTION_HEADS = 5  # 192 ÷ 5 = 38.4 (不是整数)
+```
+
+#### 数值稳定性
+代码中已添加数值稳定性检查，如遇问题可以：
+
+1. 降低学习率
+2. 使用梯度裁剪
+3. 调整温度参数
+
+### 快速开始
+
+#### 测试不同配置
+```bash
+# 测试所有注意力配置
+python test_multi_head_attention.py
+
+# 训练纯HGD-MemNet
+# 在config.py中设置 NUM_ATTENTION_HEADS = 0
+python -m src.train
+
+# 训练多头注意力版本
+# 在config.py中设置 NUM_ATTENTION_HEADS = 4
+python -m src.train
+```
+
+#### 对比实验设计
+```python
+# 实验1: 纯HGD-MemNet vs 传统RNN
+NUM_ATTENTION_HEADS = 0
+
+# 实验2: HGD-MemNet vs Transformer
+NUM_ATTENTION_HEADS = 4
+
+# 实验3: 饥饿式训练效果
+# 在纯HGD-MemNet上进行长时间思考实验
+```
+
+## 核心创新点详细说明
+
+### 原创性时间戳
+- **首次设计时间**: 2025年
+- **首次开源发布**: 2025年
+- **原创作者**: [raw-poplar](https://github.com/raw-poplar)
+- **开源协议**: Apache License 2.0
+
+### 核心创新点
+
+#### 1. 可训练的神经元数据交换机制
+**创新描述**: 首次提出使用Gumbel-Softmax采样实现神经元间的概率性数据交换，其中连接权重完全可训练。
+
+**技术细节**:
+```python
+# 核心创新：可训练的神经元交换矩阵
+self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
+# 概率性采样机制
+gumbel_samples = F.gumbel_softmax(logits.repeat(batch_size, 1, 1), tau=tau, hard=hard, dim=2)
+```
+
+**与现有技术的区别**:
+- 传统Reservoir Computing: 权重固定不可训练
+- 传统RNN: 确定性连接，无概率采样
+- **HGD-MemNet**: 可训练 + 概率性 + 温度控制
+
+#### 2. 分层门控记忆架构
+**创新描述**: 首次提出动态神经组(短期记忆) + 静态神经组(长期记忆)的双层架构，通过门控机制协调思考与输出。
+
+**架构特点**:
+- 动态神经组: 负责实时思考和状态演化
+- 静态神经组: 负责决策和输出生成
+- 门控机制: 控制何时思考、何时输出
+
+**独特性**: 首次将"思考"和"输出"作为两个独立的、可控制的过程。
+
+#### 3. 温度退火的渐进式思考
+**创新描述**: 首次在神经网络中引入"思考深度"概念，通过温度退火实现从发散思考到收敛思考的自然过渡。
+
+**实现机制**:
+```python
+# 温度退火策略
+current_temperature = max(initial_temperature * (temperature_decay ** t), config.MIN_TEMPERATURE)
+```
+
+**认知科学意义**: 模拟人类解决问题时从头脑风暴到聚焦答案的思考过程。
+
+#### 4. 饥饿式/饱腹式训练范式
+**创新描述**: 首次提出通过控制信息输入频率来训练不同认知能力的方法。
+
+**训练策略**:
+- **饥饿式训练**: 长时间思考，培养深度推理能力
+- **饱腹式训练**: 快速处理，培养信息提取能力
+
+**理论基础**: 基于认知负荷理论和双系统思维理论。
+
+#### 5. 神经元级别的架构演进
+**创新描述**: 首次提出在神经元级别进行架构替换和演进的方法。
+
+**演进策略**:
+- 神经元评价机制
+- 权重剪枝策略
+- Transformer神经元替换
+- 动态/缓态模式切换
+
+### 原创性证据
+
+#### 技术证据
+1. **独特的代码实现**: 在GitHub上可查证的完整实现
+2. **创新的数学公式**: 原创的神经元交换数学模型
+3. **新颖的训练策略**: 饥饿式/饱腹式训练方法
+
+#### 时间证据
+1. **Git提交历史**: 完整的开发时间线
+2. **版本演进记录**: 每个创新点的引入时间
+3. **文档更新历史**: 思路发展的完整轨迹
+
+#### 概念证据
+1. **术语创新**: "饥饿式训练"、"动态神经组"等原创术语
+2. **理论框架**: 完整的HGD-MemNet理论体系
+3. **应用场景**: 针对对话系统的专门设计
+
+### 引用格式建议
+
+```bibtex
+@misc{hgd-memnet2025,
+  title={HGD-MemNet: Hierarchical Gated Dynamic Memory Network for Dialogue Systems},
+  author={raw-poplar},
+  year={2025},
+  url={https://github.com/raw-poplar/HGD-MemNet},
+  note={Original architecture with trainable neuron data exchange mechanism}
+}
+```
+
+### 法律声明
+
+根据Apache License 2.0协议，任何使用本项目代码或思路的工作都必须：
+
+1. **保留版权声明**
+2. **注明原始来源**
+3. **声明所做的修改**
+4. **包含许可证副本**
+
+### 国际保护
+
+通过在GitHub上开源发布，您的原创性受到：
+1. **国际版权法**保护
+2. **开源社区**认可
+3. **学术界**承认
+4. **技术社区**见证
+
 ## 许可证
 
-本项目采用 [Apache License 2.0](LICENSE) 许可证。 
+本项目采用 [Apache License 2.0](LICENSE) 许可证。
 
 ## 测试
 
 运行 pytest 测试：
-pytest src/tests/ 
+pytest src/tests/

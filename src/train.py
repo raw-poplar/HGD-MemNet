@@ -197,8 +197,17 @@ def train_model():
         model = HGD_MemNet(
             vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
             dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
-            static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
+            static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
+            num_attention_heads=config.NUM_ATTENTION_HEADS
         ).to(DEVICE)
+
+        # 打印模型架构信息
+        if config.NUM_ATTENTION_HEADS == 0:
+            print("模型架构: 纯HGD-MemNet (无注意力机制)")
+        elif config.NUM_ATTENTION_HEADS == 1:
+            print(f"模型架构: HGD-MemNet + 单头注意力 ({config.ATTENTION_TYPE})")
+        else:
+            print(f"模型架构: HGD-MemNet + {config.NUM_ATTENTION_HEADS}头注意力 ({config.ATTENTION_TYPE})")
         
         # 新增：训练时设置软采样
         model.dynamic_group.core_rnn.use_hard_sampling = False

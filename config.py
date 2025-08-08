@@ -67,6 +67,21 @@ INITIAL_TEMPERATURE = 1.5  # 初始温度（较高值促进探索），建议1.0
 TEMPERATURE_DECAY = 0.95  # 每步温度衰减率（<1.0 以逐渐降低随机性），建议0.9-0.99
 MIN_TEMPERATURE = 0.1  # 最小温度阈值，防止过度确定性
 
+# ------------------------------------
+# 注意力机制相关参数
+# ------------------------------------
+# 注意力头数量 (0: 纯HGD-MemNet, 1: 单头注意力, >=2: 多头注意力)
+NUM_ATTENTION_HEADS = 1
+
+# 多头注意力相关参数
+ATTENTION_DROPOUT = 0.1  # 注意力dropout率
+ATTENTION_HEAD_DIM = None  # 每个注意力头的维度，None表示自动计算 (hidden_dim // num_heads)
+USE_ATTENTION_BIAS = True  # 是否在注意力计算中使用偏置
+ATTENTION_TEMPERATURE = 1.0  # 注意力温度参数，用于控制注意力分布的锐度
+
+# 注意力机制类型选择
+ATTENTION_TYPE = "bahdanau"  # 可选: "bahdanau", "dot_product", "multi_head"
+
 
 # ------------------------------------
 # 验证与模型保存

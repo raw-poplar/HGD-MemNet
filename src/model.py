@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.nn.init as init  # 新增 for xavier
 import config
 
-# --- 注意力模块 (无变化) ---
+# --- 注意力模块 ---
 class Attention(nn.Module):
     """
     标准的 Bahdanau 注意力机制
@@ -21,7 +21,7 @@ class Attention(nn.Module):
         Args:
             query (torch.Tensor): 上一步的解码器隐藏状态 (h_prev), shape: (batch_size, hidden_dim)
             keys (torch.Tensor): 编码器的所有输出 (x_ref_encoded), shape: (batch_size, seq_len, hidden_dim)
-        
+
         Returns:
             context (torch.Tensor): 上下文向量, shape: (batch_size, hidden_dim)
             attn_weights (torch.Tensor): 注意力权重, shape: (batch_size, seq_len)
@@ -30,15 +30,123 @@ class Attention(nn.Module):
         # keys shape: (batch_size, seq_len, hidden_dim)
         scores = self.Va(torch.tanh(self.Wa(query.unsqueeze(1)) + self.Ua(keys)))
         scores = scores.squeeze(2) # (batch_size, seq_len)
-        
+
         attn_weights = F.softmax(scores, dim=1)
-        
+
         # context = bmm(attn_weights.unsqueeze(1), keys)
         # context shape: (batch_size, 1, hidden_dim)
         context = torch.bmm(attn_weights.unsqueeze(1), keys)
         context = context.squeeze(1) # (batch_size, hidden_dim)
-        
+
         return context, attn_weights
+
+
+# --- 多头注意力模块 ---
+class MultiHeadAttention(nn.Module):
+    """
+    多头注意力机制
+    """
+    def __init__(self, hidden_dim, num_heads, dropout=0.1, use_bias=True, temperature=1.0):
+        super(MultiHeadAttention, self).__init__()
+        assert hidden_dim % num_heads == 0, f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.temperature = temperature
+
+        # 线性投影层
+        self.W_q = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
+        self.W_k = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
+        self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
+        self.W_o = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, query, keys):
+        """
+        Args:
+            query (torch.Tensor): shape: (batch_size, hidden_dim)
+            keys (torch.Tensor): shape: (batch_size, seq_len, hidden_dim)
+
+        Returns:
+            context (torch.Tensor): shape: (batch_size, hidden_dim)
+            attn_weights (torch.Tensor): shape: (batch_size, num_heads, 1, seq_len)
+        """
+        batch_size, seq_len, _ = keys.shape
+
+        # 扩展query维度以匹配keys
+        query = query.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+
+        # 线性投影
+        Q = self.W_q(query)  # (batch_size, 1, hidden_dim)
+        K = self.W_k(keys)   # (batch_size, seq_len, hidden_dim)
+        V = self.W_v(keys)   # (batch_size, seq_len, hidden_dim)
+
+        # 重塑为多头格式
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, 1, head_dim)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
+
+        # 计算注意力分数
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5 * self.temperature)  # (batch_size, num_heads, 1, seq_len)
+
+        # 数值稳定性检查
+        scores = torch.clamp(scores, min=-50, max=50)  # 防止溢出
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # 检查并修复NaN或无效值
+        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+            attn_weights = torch.ones_like(attn_weights) / attn_weights.size(-1)  # 均匀分布作为fallback
+
+        attn_weights = self.dropout(attn_weights)
+
+        # 应用注意力权重
+        context = torch.matmul(attn_weights, V)  # (batch_size, num_heads, 1, head_dim)
+
+        # 合并多头
+        context = context.transpose(1, 2).contiguous().view(batch_size, 1, self.hidden_dim)  # (batch_size, 1, hidden_dim)
+        context = context.squeeze(1)  # (batch_size, hidden_dim)
+
+        # 输出投影
+        context = self.W_o(context)
+
+        # 残差连接和层归一化
+        context = self.layer_norm(context + query.squeeze(1))
+
+        return context, attn_weights.squeeze(2)  # (batch_size, hidden_dim), (batch_size, num_heads, seq_len)
+
+
+# --- 灵活的注意力工厂 ---
+class AttentionFactory:
+    """
+    注意力机制工厂类，根据配置创建不同类型的注意力机制
+    """
+    @staticmethod
+    def create_attention(hidden_dim, num_heads=1, attention_type="bahdanau", **kwargs):
+        """
+        创建注意力机制
+
+        Args:
+            hidden_dim: 隐藏层维度
+            num_heads: 注意力头数量 (0: 无注意力, 1: 单头, >=2: 多头)
+            attention_type: 注意力类型
+            **kwargs: 其他参数
+
+        Returns:
+            注意力模块或None
+        """
+        if num_heads == 0:
+            return None
+        elif num_heads == 1:
+            if attention_type == "bahdanau":
+                return Attention(hidden_dim)
+            else:
+                # 单头也可以使用多头注意力实现
+                return MultiHeadAttention(hidden_dim, 1, **kwargs)
+        else:
+            return MultiHeadAttention(hidden_dim, num_heads, **kwargs)
 
 
 # --- 新: 可训练的“蓄水池”式RNN单元 ---
@@ -136,19 +244,38 @@ class DynamicGroup(nn.Module):
     模型的核心，一个动态演化的神经组。
     核心RNN被替换为ReservoirRNNCell以匹配描述。
     """
-    def __init__(self, embed_dim, hidden_dim):
+    def __init__(self, embed_dim, hidden_dim, num_attention_heads=1, attention_config=None):
         super(DynamicGroup, self).__init__()
         self.hidden_dim = hidden_dim
-        
+        self.num_attention_heads = num_attention_heads
+
         # 编码器: 用于处理参照输入 x_ref (保持不变)
         self.encoder_rnn = nn.GRU(embed_dim, hidden_dim, batch_first=True)
         self.x_t_encoder = nn.GRU(embed_dim, hidden_dim, batch_first=True)  # 新增：x_t的独立GRU编码器
-        
-        # 注意力模块 (保持不变)
-        self.attention = Attention(hidden_dim)
+
+        # 灵活的注意力机制
+        if attention_config is None:
+            attention_config = {}
+
+        self.attention = AttentionFactory.create_attention(
+            hidden_dim=hidden_dim,
+            num_heads=num_attention_heads,
+            attention_type=attention_config.get('type', 'bahdanau'),
+            dropout=attention_config.get('dropout', 0.1),
+            use_bias=attention_config.get('use_bias', True),
+            temperature=attention_config.get('temperature', 1.0)
+        )
+
+        # 根据是否有注意力机制决定输入大小
+        if self.attention is not None:
+            core_input_size = hidden_dim + hidden_dim  # x_t_encoded + attn_context
+        else:
+            # 无注意力版本：使用历史信息的全局表示
+            self.history_projector = nn.Linear(hidden_dim, hidden_dim)
+            core_input_size = hidden_dim + hidden_dim  # x_t_encoded + history_context
 
         # 核心演化RNN: 被替换为新的可训练“蓄水池”单元
-        self.core_rnn = ReservoirRNNCell(hidden_dim + hidden_dim, hidden_dim)  # 更新输入大小：x_t_encoded + attn_context
+        self.core_rnn = ReservoirRNNCell(core_input_size, hidden_dim)
 
         self.norm = nn.LayerNorm(hidden_dim)  # 新增：LayerNorm for RNN输出
 
@@ -170,13 +297,20 @@ class DynamicGroup(nn.Module):
         else:
             _, x_t_encoded = self.x_t_encoder(x_t)  # 使用GRU编码x_t，获取最后隐藏状态 (1, batch, hidden) -> squeeze to (batch, hidden)
             x_t_encoded = x_t_encoded.squeeze(0)
-        
-        # 1. 使用注意力机制计算上下文向量
-        # h_prev 是 query, x_ref_encoded 是 keys
-        attn_context, _ = self.attention(h_prev, x_ref_encoded)  # 忽略注意力权重
-        
-        # 2. 将注意力上下文向量和当前输入拼接
-        rnn_input = torch.cat((x_t_encoded, attn_context), dim=1)  # (batch, hidden + hidden)
+
+        # 1. 计算上下文向量
+        if self.attention is not None:
+            # 使用注意力机制计算上下文向量
+            # h_prev 是 query, x_ref_encoded 是 keys
+            context, _ = self.attention(h_prev, x_ref_encoded)  # 忽略注意力权重
+        else:
+            # 无注意力版本：使用历史信息的全局表示
+            # 简单的平均池化 + 线性投影
+            history_pooled = torch.mean(x_ref_encoded, dim=1)  # (batch_size, hidden_dim)
+            context = self.history_projector(history_pooled)  # (batch_size, hidden_dim)
+
+        # 2. 将上下文向量和当前输入拼接
+        rnn_input = torch.cat((x_t_encoded, context), dim=1)  # (batch, hidden + hidden)
 
         # 3. 将拼接后的向量输入到核心RNN
         # h_prev shape: (batch_size, hidden_dim) for our cell
@@ -185,7 +319,7 @@ class DynamicGroup(nn.Module):
 
         h_next = self.norm(h_next)  # 应用LayerNorm
 
-        return h_next, attn_context
+        return h_next, context
 
 
 # --- 静态网络对 (决策模块) ---
@@ -246,6 +380,10 @@ class StaticHead(nn.Module):
         sampling_logits = self.random_sampler(random_pool)  # 生成采样logits (batch, random_pool_dim)
         sampling_probs = F.softmax(sampling_logits, dim=1)  # 转换为概率
 
+        # 添加数值稳定性检查
+        sampling_probs = torch.clamp(sampling_probs, min=1e-8, max=1.0)  # 防止概率为0或负数
+        sampling_probs = sampling_probs / sampling_probs.sum(dim=1, keepdim=True)  # 重新归一化
+
         # 修正：采样 self.num_random 个索引
         rand_indices = torch.multinomial(sampling_probs, self.num_random, replacement=False)  # (batch, num_random)
 
@@ -269,12 +407,31 @@ class HGD_MemNet(nn.Module):
     分层门控动态记忆网络 (Hierarchical Gated-Dynamic Memory Network)
     整合了所有模块
     """
-    def __init__(self, vocab_size, embed_dim, dynamic_hidden_dim, static_hidden_dim):
+    def __init__(self, vocab_size, embed_dim, dynamic_hidden_dim, static_hidden_dim,
+                 num_attention_heads=None, attention_config=None):
         super(HGD_MemNet, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        
-        self.dynamic_group = DynamicGroup(embed_dim, dynamic_hidden_dim)
-        
+
+        # 如果没有指定注意力头数，从config中获取
+        if num_attention_heads is None:
+            num_attention_heads = config.NUM_ATTENTION_HEADS
+
+        # 构建注意力配置
+        if attention_config is None:
+            attention_config = {
+                'type': config.ATTENTION_TYPE,
+                'dropout': config.ATTENTION_DROPOUT,
+                'use_bias': config.USE_ATTENTION_BIAS,
+                'temperature': config.ATTENTION_TEMPERATURE
+            }
+
+        self.dynamic_group = DynamicGroup(
+            embed_dim,
+            dynamic_hidden_dim,
+            num_attention_heads=num_attention_heads,
+            attention_config=attention_config
+        )
+
         self.static_head = StaticHead(
             hidden_dim=static_hidden_dim,
             sampler_input_dim=dynamic_hidden_dim,  # 从DynamicGroup的完整输出中采样
