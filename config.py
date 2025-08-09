@@ -189,6 +189,8 @@ CONTROL_GATE_ALPHA = 0.0
 # 剪枝与再生长（动态稀疏）设置
 # ------------------------------------
 PRUNE_ENABLE = False           # 开关：是否启用训练中剪枝
+USAGE_EMA_BETA = 0.9          # 使用频度的EMA系数（与 HEBB_EMA_BETA 可一致）
+
 PRUNE_START_STEPS = 2000       # 从第多少个总更新步开始剪枝（暖身）
 PRUNE_EVERY_STEPS = 1000       # 每多少个总更新步进行一次剪枝
 PRUNE_SPARSE_STEP = 0.05       # 每次新增剪枝比例（相对于当前激活连接的比例）

@@ -172,9 +172,10 @@ class ReservoirRNNCell(nn.Module):
         # 可训练权重矩阵：(hidden_out, hidden_in)，每个行代表一个输出神经元的出边权重到输入神经元。
         self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
         init.xavier_uniform_(self.W_hh_matrix)  # 优化初始化 for 稳定性
-        # 剪枝与再生长：连接掩码与赫布分数缓冲
+        # 剪枝与再生长：连接掩码与统计缓冲（赫布分数/使用频度）
         self.register_buffer("hh_mask", torch.ones(hidden_size, hidden_size))
         self.register_buffer("hebb_score", torch.zeros(hidden_size, hidden_size))
+        self.register_buffer("usage_score", torch.zeros(hidden_size, hidden_size))  # gumbel 概率的EMA
 
     def forward(self, x_t, h_prev, temperature=None):
         """
@@ -238,6 +239,13 @@ class ReservoirRNNCell(nn.Module):
         # 为了保持 tau 的可学习性，我们将温度并入 logits 缩放，这里将 gumbel_softmax 的 tau 固定为1.0
         gumbel_samples = F.gumbel_softmax(logits.repeat(batch_size, 1, 1), tau=1.0, hard=hard, dim=2)
 
+        # 使用频度统计（EMA）：每条连接在本批次被采样的“概率”均值
+        if self.training:
+            with torch.no_grad():
+                usage_batch = gumbel_samples.mean(dim=0)  # (hidden_out, hidden_in)
+                ubeta = getattr(config, 'USAGE_EMA_BETA', getattr(config, 'HEBB_EMA_BETA', 0.9))
+                self.usage_score.mul_(ubeta).add_((1.0 - ubeta) * usage_batch)
+
         # 步骤4: 计算贡献 - einsum 高效矩阵乘法：sum over input neurons (batch, hidden_out)
         if self.hidden_size > 512:
             contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)  # 替代以加速大矩阵
@@ -248,14 +256,16 @@ class ReservoirRNNCell(nn.Module):
         h_preact = input_contrib + contrib
         h_next = torch.tanh(h_preact)
 
-        # 赫布分数累计：只在训练态统计 |h_prev|·|h_next| 的EMA
+        # 赫布×使用频度 统计：仅在训练态统计 EMA
         if self.training:
             with torch.no_grad():
-                pre = h_prev.abs()
-                post = h_next.abs()
+                pre = h_prev.abs()                  # (batch, hidden_in)
+                post = h_next.abs()                 # (batch, hidden_out)
                 hebb_batch = torch.einsum('bo,bh->oh', post, pre) / max(1, h_prev.size(0))
+                usage_batch = gumbel_samples.mean(dim=0)  # (hidden_out, hidden_in) 软选择概率的均值
                 beta = getattr(config, 'HEBB_EMA_BETA', 0.9)
                 self.hebb_score.mul_(beta).add_((1.0 - beta) * hebb_batch)
+                self.usage_score.mul_(beta).add_((1.0 - beta) * usage_batch)
 
         return h_next
 
@@ -284,14 +294,25 @@ class ReservoirRNNCell(nn.Module):
             self.hh_mask.copy_(new_mask)
 
     def regrow_by_hebb(self, per_row=1, init_std=1e-3):
-        """按赫布分数在被剪枝位置里每行再生长若干连接。"""
+        """按组合评分在被剪枝位置里每行再生长若干连接：score = norm(hebb) × norm(usage)。"""
         if per_row <= 0:
             return
         with torch.no_grad():
             pruned = (self.hh_mask == 0)
             if pruned.sum() == 0:
                 return
-            score = self.hebb_score.clone()
+            # 行内 min-max 规范化，避免尺度偏置
+            eps = 1e-8
+            hebb = self.hebb_score.clone()
+            usage = self.usage_score.clone()
+            # 对每行做 (x - min)/(max - min + eps)
+            h_min, _ = hebb.min(dim=1, keepdim=True)
+            h_max, _ = hebb.max(dim=1, keepdim=True)
+            u_min, _ = usage.min(dim=1, keepdim=True)
+            u_max, _ = usage.max(dim=1, keepdim=True)
+            hebb_n = (hebb - h_min) / (h_max - h_min + eps)
+            usage_n = (usage - u_min) / (u_max - u_min + eps)
+            score = hebb_n * usage_n
             # 只在 pruned 集合上挑分数最高的 per_row 个
             score[~pruned] = -1e9
             topk_vals, topk_idx = torch.topk(score, k=per_row, dim=1)
