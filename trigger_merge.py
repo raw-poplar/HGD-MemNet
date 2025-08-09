@@ -9,7 +9,7 @@ import sys
 import glob
 sys.path.append('.')
 import config
-from src.prepare_binary_data import merge_chunks
+from src.data_processing.prepare_binary_data import merge_chunks
 
 def cleanup_and_merge():
     """清理partial文件并触发合并"""

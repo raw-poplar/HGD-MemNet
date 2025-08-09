@@ -133,6 +133,19 @@ class TestTrainingComponents:
         assert lrs[4] < lrs[2]  # 第4步后应该再次下降
 
 
+def _grad_total_norm(parameters, norm_type=2.0):
+    params = [p for p in parameters if p.grad is not None]
+    if not params:
+        return torch.tensor(0.0)
+    if norm_type == float('inf'):
+        return torch.tensor(max(p.grad.detach().abs().max().item() for p in params))
+    total = 0.0
+    for p in params:
+        param_norm = p.grad.detach().data.norm(norm_type).item()
+        total += param_norm ** norm_type
+    return torch.tensor(total ** (1.0 / norm_type))
+
+
 class TestTrainingStability:
     """测试训练稳定性"""
     
@@ -166,13 +179,17 @@ class TestTrainingStability:
         loss.backward()
         
         # 计算梯度范数
-        grad_norm_before = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
-        
+        grad_norm_before = _grad_total_norm(self.model.parameters(), 2.0)
+
         # 应用梯度裁剪
         max_norm = 1.0
-        grad_norm_after = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-        
-        # 检查梯度被正确裁剪
+        _ = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+
+        # 重新计算裁剪之后的梯度范数（实际值）
+        grad_norm_after = _grad_total_norm(self.model.parameters(), 2.0)
+
+        # 检查裁剪确实生效（范数不增且不超过阈值）
+        assert grad_norm_after <= grad_norm_before + 1e-6
         assert grad_norm_after <= max_norm + 1e-6
     
     def test_nan_gradient_detection(self):

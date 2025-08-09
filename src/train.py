@@ -15,7 +15,7 @@ cudnn.benchmark = True  # 启用 cudnn 基准测试以加速
 import config
 from .model import HGD_MemNet
 from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
-from .utils import load_model_from_checkpoint, compute_loss  # 新增：导入工具函数
+from .utils import compute_loss  # 新增：导入工具函数
 import logging  # 新增：日志记录
 
 # 设置日志
@@ -23,6 +23,10 @@ logging.basicConfig(filename='train.log', level=logging.INFO, format='%(asctime)
 
 # 设置设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 可选：确定性设置（由 config 决定）
+if getattr(config, 'DETERMINISTIC', False):
+    cudnn.benchmark = False
+    cudnn.deterministic = True
 
 def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     """
@@ -30,26 +34,26 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     并动态调整学习率。
     """
     model.train()
-    x_ref_padded = x_ref_padded.to(DEVICE)
-    
+    x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+
     batch_size = x_ref_padded.size(0)
     total_batch_loss = 0.0
     steps_updated = 0
-    
+
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
-    
+
     original_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
-    
+
     # 新增：温度退火参数 (从config导入)
     initial_temperature = config.INITIAL_TEMPERATURE
     temperature_decay = config.TEMPERATURE_DECAY
 
     for t in range(len(steps_data)):
         x_t_padded, target_padded, gate_target = steps_data[t]
-        x_t_padded = x_t_padded.to(DEVICE) if x_t_padded is not None else None
-        gate_target = gate_target.to(DEVICE)
+        x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
+        gate_target = gate_target.to(DEVICE, non_blocking=True)
         if target_padded is not None:
-            target_padded = target_padded.to(DEVICE)
+            target_padded = target_padded.to(DEVICE, non_blocking=True)
 
         # 1. 在每个时间步内部动态调整学习率
         for i, param_group in enumerate(optimizer.param_groups):
@@ -59,14 +63,11 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         current_temperature = max(initial_temperature * (temperature_decay ** t), config.MIN_TEMPERATURE)
 
         optimizer.zero_grad()
-        
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature)  # 更新：传入温度
-            
-            # 使用 utils 中的 compute_loss
+
+        with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature)
             step_loss = compute_loss(gate_pred, gate_target, output_logits, target_padded)
-            
-        # 2. 立即进行反向传播和参数更新
+
         scaler.scale(step_loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -76,10 +77,21 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         total_batch_loss += step_loss.item()
         h_prev = h_next.detach()
         steps_updated += 1
-        
+
+        # 基于门控的多步思考早停（开关）
+        if getattr(config, 'USE_GATED_MULTISTEP', False):
+            if (gate_pred.mean().item() >= config.GATE_THRESHOLD):
+                break
+
     for i, param_group in enumerate(optimizer.param_groups):
         param_group['lr'] = original_lrs[i]
-        
+
+        # 伪代码说明：
+        # for t in steps:
+        #   ... 前向得到 gate_pred
+        #   if USE_GATED_MULTISTEP and gate_pred >= GATE_THRESHOLD:
+        #       break  # 提前终止内部步，模拟“已决定输出”
+
     return total_batch_loss, steps_updated
 
 def validate_model(model):
@@ -101,34 +113,39 @@ def validate_model(model):
         batch_size=config.BATCH_SIZE,
         collate_fn=binary_collate_fn,
         num_workers=min(os.cpu_count(), 2),  # 同样限制为2
-        shuffle=False
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+        prefetch_factor=2,
+        shuffle=False,
     )
 
     total_val_loss = 0
     total_steps = 0
     with torch.no_grad():
+        # 验证阶段使用硬采样
+        model.dynamic_group.core_rnn.use_hard_sampling = True
         pbar = tqdm(val_loader, desc="正在验证")
         for x_ref_padded, steps_data in pbar:
-            x_ref_padded = x_ref_padded.to(DEVICE)
+            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
-            
-            for x_t, y_t, g_t in steps_data:
-                x_t = x_t.to(DEVICE) if x_t is not None else None
-                y_t = y_t.to(DEVICE) if y_t is not None else None
-                g_t = g_t.to(DEVICE)
 
-                # 新增：在验证时使用硬采样和低温
-                model.dynamic_group.core_rnn.use_hard_sampling = True  # 切换到硬采样
+            for x_t, y_t, g_t in steps_data:
+                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
+                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
+                g_t = g_t.to(DEVICE, non_blocking=True)
+
+                # 新增：在验证时使用低温
                 h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温
-                model.dynamic_group.core_rnn.use_hard_sampling = False  # 恢复
-                
+
                 # 使用 utils 中的 compute_loss
                 step_loss = compute_loss(gate_pred, g_t, output_logits, y_t)
-                
+
                 total_val_loss += step_loss.item()
                 h_prev = h_next
                 total_steps += 1
 
+    # 恢复软采样
+    model.dynamic_group.core_rnn.use_hard_sampling = False
     avg_val_loss = total_val_loss / total_steps if total_steps > 0 else 0
     model.train()
     return avg_val_loss
@@ -137,7 +154,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, steps, directory, is_best=F
     if not os.path.exists(directory): os.makedirs(directory)
     filename = f"checkpoint_epoch_{epoch}_steps_{steps}.pth"
     filepath = os.path.join(directory, filename)
-    
+
     checkpoints = sorted(glob.glob(os.path.join(directory, "checkpoint_*.pth")), key=os.path.getmtime)
     if len(checkpoints) >= config.MAX_CHECKPOINTS_TO_KEEP:
         for old_checkpoint in checkpoints[:len(checkpoints) - config.MAX_CHECKPOINTS_TO_KEEP + 1]:
@@ -149,7 +166,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, steps, directory, is_best=F
         'model_state_dict': model_state, 'optimizer_state_dict': optimizer.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
     }, filepath)
-    
+
     print(f"检查点已保存至 {filepath}")
     if is_best:
         best_filepath = os.path.join(config.BEST_MODEL_DIR, "best_model.pth")
@@ -166,14 +183,19 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
     latest_checkpoint_path = max(checkpoints, key=os.path.getmtime)
     print(f"正在从最新的检查点加载: {latest_checkpoint_path}")
     checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE)
-    
+
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    # 将优化器状态迁移到当前设备
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(DEVICE)
     if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
-    
+
     start_epoch = checkpoint.get('epoch', 0)
     total_steps = checkpoint.get('total_steps', 0)
-    
+
     print(f"已从 '{latest_checkpoint_path}' 加载 (轮次 {start_epoch}, 总步数 {total_steps})。")
     return start_epoch, total_steps
 
@@ -208,7 +230,7 @@ def train_model():
             print(f"模型架构: HGD-MemNet + 单头注意力 ({config.ATTENTION_TYPE})")
         else:
             print(f"模型架构: HGD-MemNet + {config.NUM_ATTENTION_HEADS}头注意力 ({config.ATTENTION_TYPE})")
-        
+
         # 新增：训练时设置软采样
         model.dynamic_group.core_rnn.use_hard_sampling = False
 
@@ -220,7 +242,7 @@ def train_model():
         start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
 
         train_data_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
-        
+
         best_val_loss = float('inf')
 
         # 新增：全局学习率调度器
@@ -230,23 +252,32 @@ def train_model():
             train_dataset = BinaryDialogueDataset(train_data_dir)
             # 注意：不再需要除以梯度累积步数
             train_loader = DataLoader(
-                train_dataset, batch_size=config.BATCH_SIZE,
-                collate_fn=binary_collate_fn, num_workers=min(os.cpu_count(), 2),  # 限制为2以降低内存使用
-                pin_memory=True, shuffle=True
+                train_dataset,
+                batch_size=config.BATCH_SIZE,
+                collate_fn=binary_collate_fn,
+                num_workers=min(os.cpu_count(), 2),  # 限制为2以降低内存使用
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=True,
+                prefetch_factor=2,
+                shuffle=True,
             )
 
             pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
-            
+
             for x_ref_padded, steps_data in pbar:
                 batch_loss, steps_in_batch = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
-                
+
                 total_steps += steps_in_batch
                 avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
-                pbar.set_postfix({"平均步损失": f"{avg_loss:.4f}", "总更新步数": total_steps})
+                pbar.set_postfix({
+                    "平均步损失": f"{avg_loss:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                    "总更新步数": total_steps,
+                })
 
                 if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                     save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
-                
+
                 if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
                     val_loss = validate_model(model)
                     print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
@@ -269,6 +300,6 @@ if __name__ == "__main__":
     train_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
     if not os.path.isdir(train_dir):
         print(f"错误: 未找到处理后的二进制数据目录 '{train_dir}'。")
-        print("请先运行 'python -m src.prepare_binary_data' 来生成数据。")
+        print("请先运行 'python -m src.data_processing.prepare_binary_data' 来生成数据。")
     else:
-        train_model() 
+        train_model()

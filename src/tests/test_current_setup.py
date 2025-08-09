@@ -14,15 +14,15 @@ from src.dataset import Vocabulary
 
 def test_current_setup():
     """测试当前设置是否正确"""
-    print("🔍 测试当前设置...")
+    print("测试当前设置...")
     
     # 1. 检查路径配置
-    print(f"📁 LCCC_PROCESSED_PATH: {config.LCCC_PROCESSED_PATH}")
+    print(f"LCCC_PROCESSED_PATH: {config.LCCC_PROCESSED_PATH}")
     
     # 2. 检查词汇表文件
     vocab_path = os.path.join(config.LCCC_PROCESSED_PATH, "vocabulary.json")
-    print(f"📚 词汇表路径: {vocab_path}")
-    print(f"📚 词汇表存在: {os.path.exists(vocab_path)}")
+    print(f"词汇表路径: {vocab_path}")
+    print(f"词汇表存在: {os.path.exists(vocab_path)}")
     
     if os.path.exists(vocab_path):
         try:
@@ -30,19 +30,19 @@ def test_current_setup():
                 vocab_dict = json.load(f)
             vocab = Vocabulary("lccc")
             vocab.__dict__.update(vocab_dict)
-            print(f"✅ 词汇表加载成功，大小: {vocab.num_words}")
+            print(f"词汇表加载成功，大小: {vocab.num_words}")
         except Exception as e:
-            print(f"❌ 词汇表加载失败: {e}")
+            print(f"词汇表加载失败: {e}")
             return False
     else:
-        print(f"❌ 词汇表文件不存在")
+        print(f"词汇表文件不存在")
         return False
     
     # 3. 检查数据文件
     data_types = ["train", "valid", "test"]
     for data_type in data_types:
         data_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}.jsonl")
-        print(f"📄 {data_type}.jsonl 存在: {os.path.exists(data_file)}")
+        print(f"{data_type}.jsonl 存在: {os.path.exists(data_file)}")
         
         if os.path.exists(data_file):
             # 检查文件大小
@@ -55,18 +55,18 @@ def test_current_setup():
                     first_line = f.readline()
                     if first_line:
                         dialogue = json.loads(first_line)
-                        print(f"   ✅ 可以读取，样本对话长度: {len(dialogue)}")
+                        print(f"   可以读取，样本对话长度: {len(dialogue)}")
                     else:
-                        print(f"   ⚠️  文件为空")
+                        print(f"   文件为空")
             except Exception as e:
-                print(f"   ❌ 读取失败: {e}")
+                print(f"   读取失败: {e}")
     
     # 4. 检查现有chunk文件
     for data_type in data_types:
         chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
         if os.path.exists(chunk_dir):
             chunk_files = [f for f in os.listdir(chunk_dir) if f.startswith("chunk_") and f.endswith(".pt")]
-            print(f"📦 {data_type} 现有chunk数: {len(chunk_files)}")
+            print(f"{data_type} 现有chunk数: {len(chunk_files)}")
             
             if chunk_files:
                 # 找到最大编号
@@ -83,7 +83,7 @@ def test_current_setup():
                     print(f"   最大chunk编号: {max_chunk}")
                     print(f"   下一个chunk将是: chunk_{max_chunk + 1}.pt")
         else:
-            print(f"📦 {data_type} chunk目录不存在")
+            print(f"{data_type} chunk目录不存在")
     
     # 5. 检查resume文件
     for data_type in data_types:
@@ -93,17 +93,17 @@ def test_current_setup():
             try:
                 with open(resume_file, 'r') as f:
                     resume_data = json.load(f)
-                print(f"🔄 {data_type} resume信息: {resume_data}")
+                print(f"{data_type} resume信息: {resume_data}")
             except Exception as e:
-                print(f"🔄 {data_type} resume文件损坏: {e}")
+                print(f"{data_type} resume文件损坏: {e}")
         else:
-            print(f"🔄 {data_type} 无resume文件（将从头开始）")
+            print(f"{data_type} 无resume文件（将从头开始）")
     
     return True
 
 def estimate_processing_time():
     """估算处理时间"""
-    print(f"\n⏱️  处理时间估算:")
+    print(f"\n处理时间估算:")
     
     # 检查文件大小
     total_size = 0
@@ -142,17 +142,17 @@ def estimate_processing_time():
             print(f"     {mode}: {time_seconds:.1f} 秒")
 
 if __name__ == "__main__":
-    print("🧪 测试当前设置...")
+    print("测试当前设置...")
     
     if test_current_setup():
-        print(f"\n✅ 设置检查通过！")
+        print(f"\n设置检查通过！")
         estimate_processing_time()
         
-        print(f"\n💡 建议:")
+        print(f"\n建议:")
         print(f"1. 使用 4-8 个worker进程以获得最佳性能")
         print(f"2. 监控内存使用，确保不超过系统限制")
         print(f"3. 处理过程中可以随时中断，支持断点续传")
         print(f"4. 完成后会自动合并为最终的train/valid/test文件")
     else:
-        print(f"\n❌ 设置检查失败！")
+        print(f"\n设置检查失败！")
         print(f"请检查路径配置和文件完整性")

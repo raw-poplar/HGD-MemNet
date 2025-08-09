@@ -35,10 +35,10 @@ def run_unit_tests():
             "--tb=short"
         ])
         if result != 0:
-            print(f"❌ {test_file} 测试失败")
+            print(f"{test_file} 测试失败")
             return False
         else:
-            print(f"✅ {test_file} 测试通过")
+            print(f"{test_file} 测试通过")
     
     return True
 
@@ -61,10 +61,10 @@ def run_integration_tests():
             "--tb=short"
         ])
         if result != 0:
-            print(f"❌ {test_file} 测试失败")
+            print(f"{test_file} 测试失败")
             return False
         else:
-            print(f"✅ {test_file} 测试通过")
+            print(f"{test_file} 测试通过")
     
     return True
 
@@ -89,10 +89,10 @@ def run_performance_tests():
             "-s"  # 显示print输出
         ])
         if result != 0:
-            print(f"❌ {test_file} 测试失败")
+            print(f"{test_file} 测试失败")
             return False
         else:
-            print(f"✅ {test_file} 测试通过")
+            print(f"{test_file} 测试通过")
 
     return True
 
@@ -120,30 +120,30 @@ def run_utility_tests():
                 ], capture_output=True, text=True, timeout=120)
 
                 if result.returncode == 0:
-                    print(f"✅ {script} 执行成功")
+                    print(f"{script} 执行成功")
                     if result.stdout:
                         print("输出:")
                         print(result.stdout[-500:])  # 显示最后500字符
                 else:
-                    print(f"❌ {script} 执行失败")
+                    print(f"{script} 执行失败")
                     if result.stderr:
                         print("错误:")
                         print(result.stderr[-500:])
                     return False
             except subprocess.TimeoutExpired:
-                print(f"⏰ {script} 执行超时")
+                print(f"{script} 执行超时")
                 return False
             except Exception as e:
-                print(f"❌ {script} 执行出错: {e}")
+                print(f"{script} 执行出错: {e}")
                 return False
         else:
-            print(f"⚠️  {script} 不存在，跳过")
+            print(f"{script} 不存在，跳过")
 
     return True
 
 def run_all_tests():
     """运行所有测试"""
-    print("🚀 开始运行完整测试套件...")
+    print("开始运行完整测试套件...")
     
     success = True
     
@@ -161,9 +161,9 @@ def run_all_tests():
     
     print("\n" + "=" * 60)
     if success:
-        print("🎉 所有测试通过！")
+        print("所有测试通过！")
     else:
-        print("❌ 部分测试失败，请检查上述输出")
+        print("部分测试失败，请检查上述输出")
     print("=" * 60)
     
     return success
@@ -194,7 +194,7 @@ def run_coverage_report():
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
-            print("✅ 覆盖率测试完成")
+            print("覆盖率测试完成")
             
             # 生成报告
             subprocess.run([sys.executable, "-m", "coverage", "report"])
@@ -206,14 +206,14 @@ def run_coverage_report():
             ], capture_output=True)
             
             if html_result.returncode == 0:
-                print(f"📊 HTML覆盖率报告已生成: {project_root}/htmlcov/index.html")
+                print(f"HTML覆盖率报告已生成: {project_root}/htmlcov/index.html")
         else:
-            print("❌ 覆盖率测试失败")
+            print("覆盖率测试失败")
             print(result.stderr)
             return False
             
     except Exception as e:
-        print(f"❌ 覆盖率测试出错: {e}")
+        print(f"覆盖率测试出错: {e}")
         return False
     
     return True
@@ -234,16 +234,16 @@ def check_dependencies():
     for package in required_packages:
         try:
             __import__(package)
-            print(f"✅ {package}")
+            print(f"{package}")
         except ImportError:
-            print(f"❌ {package} (缺失)")
+            print(f"{package} (缺失)")
             missing_packages.append(package)
     
     if missing_packages:
         print(f"\n请安装缺失的包: pip install {' '.join(missing_packages)}")
         return False
     
-    print("✅ 所有依赖已满足")
+    print("所有依赖已满足")
     return True
 
 def main():

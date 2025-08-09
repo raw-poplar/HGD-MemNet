@@ -132,7 +132,7 @@ HGD-MemNet/
 │   ├── chat.py               # 与训练好的模型进行交互式聊天的脚本
 │   ├── chat_web.py           # Web界面聊天脚本
 │   ├── utils.py              # 工具函数
-│   ├── data_processing/      # 数据处理模块
+│   ├── data_processing/      # 数据处理模块（所有预处理脚本集中于此）
 │   │   ├── prepare_binary_data.py  # 将 .jsonl 转换为分块二进制数据的预处理脚本
 │   │   ├── merge_tools.py    # 数据合并工具
 │   │   ├── data_utils.py     # 数据处理工具函数
@@ -214,15 +214,15 @@ pip install -r requirements.txt
     python -m src.data_processing.merge_tools --verify
     ```
 
-    运行完毕后，您的 `processed_data/` 目录下应该会看到 `train.pt`, `valid.pt`, `test.pt` 文件和一个 `vocabulary.json`。
+    运行完毕后，您的 `processed_data/` 目录下应该会看到 `train/`, `valid/`, `test/` 三个子目录下的 chunk_*.pt 文件或已合并的 train.pt、valid.pt、test.pt 以及词汇表 `vocabulary.json`。
 
 ### 4. 配置注意力机制（可选）
 
-在开始训练前，您可以根据需要配置注意力机制。在 `config.py` 中修改 `ATTENTION_HEADS` 参数：
+在开始训练前，您可以根据需要配置注意力机制。在 `config.py` 中修改 `NUM_ATTENTION_HEADS` 参数：
 
 ```python
 # 在 config.py 中设置
-ATTENTION_HEADS = 8  # 可选值: 0, 1, 或任意正整数
+NUM_ATTENTION_HEADS = 4  # 可选值: 0, 1, 或任意正整数
 
 # 配置说明:
 # 0: 纯HGD-MemNet架构（无注意力，计算效率最高）
@@ -243,6 +243,18 @@ python examples/attention_config_demo.py
 ```bash
 python -m src.train
 ```
+
+注意：如果提示未找到处理后的数据，请先执行数据预处理：
+
+```bash
+python -m src.data_processing.prepare_binary_data --num_workers=4
+```
+
+
+提示:
+- 默认启用温度退火（config.INITIAL_TEMPERATURE, TEMPERATURE_DECAY, MIN_TEMPERATURE）
+- 可选启用“门控多步思考早停”：在 config.py 中设置 USE_GATED_MULTISTEP = True
+- 可选切换静态头采样策略：在 config.py 中设置 USE_SOFT_TOPK_TRAINING = True/False
 
 *   训练日志、验证损失和检查点会保存在 `config.CHECKPOINT_DIR` 指定的目录中。
 *   表现最好的模型会被额外保存到 `config.BEST_MODEL_DIR`。
@@ -319,10 +331,10 @@ python -m src.data_processing.vocabulary.test_vocabulary_builder
 
 - **训练优化**：实现了温度退火（从高到低衰减）和硬/软采样切换，以提升探索性和稳定性。
 - **架构增强**：添加了 x_t 的独立编码器、可学习采样权重和 LayerNorm，以提高模型鲁棒性和效率。
-- **可配置注意力机制**：支持三种注意力模式，可在 `config.py` 中通过 `ATTENTION_HEADS` 参数配置：
-  - `ATTENTION_HEADS = 0`：纯HGD-MemNet架构，使用平均池化替代注意力机制
-  - `ATTENTION_HEADS = 1`：单头注意力机制（Bahdanau注意力）
-  - `ATTENTION_HEADS > 1`：多头注意力机制，默认为8头
+- **可配置注意力机制**：支持三种注意力模式，可在 `config.py` 中通过 `NUM_ATTENTION_HEADS` 参数配置：
+  - `NUM_ATTENTION_HEADS = 0`：纯HGD-MemNet架构，使用平均池化替代注意力机制
+  - `NUM_ATTENTION_HEADS = 1`：单头注意力机制（Bahdanau注意力）
+  - `NUM_ATTENTION_HEADS > 1`：多头注意力机制（示例：4头、8头）
 - **建议**：监控温度参数，实验不同衰减率；对于大模型，考虑分布式训练。
 
 ## 原创性声明
@@ -606,5 +618,25 @@ current_temperature = max(initial_temperature * (temperature_decay ** t), config
 
 ## 测试
 
-运行 pytest 测试：
-pytest src/tests/
+为了节省时间，推荐按需、小粒度地运行测试用例：
+
+- 运行单个文件：
+  - pytest -q src/tests/test_training.py
+- 运行单个测试类：
+  - pytest -q src/tests/test_training.py::TestTrainingStability
+- 运行单个测试函数：
+  - pytest -q src/tests/test_training.py::TestTrainingStability::test_gradient_clipping
+- 关键词筛选（在某文件或整个 tests 下）：
+  - 只跑名称包含 gradient 的用例：pytest -q -k "gradient" src/tests
+- 只运行上次失败的用例：
+  - pytest -q --lf src/tests
+- 发现第一个失败就停：
+  - pytest -q -x src/tests/test_training.py
+
+性能/多进程相关测试通常较慢，建议按需执行：
+- pytest -q src/tests/test_multiprocessing_performance.py
+- pytest -q src/tests/test_performance.py
+- pytest -q src/tests/test_quick_performance.py
+
+需要完整运行时：
+- pytest -q src/tests

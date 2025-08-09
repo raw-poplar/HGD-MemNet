@@ -58,7 +58,7 @@ def create_old_format_data():
 
 def create_new_format_data():
     """创建修改后的数据格式（思考步骤中x_t使用None）"""
-    from src.prepare_binary_data import process_dialogue_to_tensors
+    from src.data_processing.prepare_binary_data import process_dialogue_to_tensors
     
     vocab = Vocabulary("test")
     vocab.addSentence("hello world")
@@ -112,16 +112,16 @@ def test_data_compatibility():
     
     try:
         x_ref_batch_old, steps_batch_old = binary_collate_fn(batch_old)
-        print("✅ 修改前格式可以正常批处理")
+        print("修改前格式可以正常批处理")
     except Exception as e:
-        print(f"❌ 修改前格式批处理失败: {e}")
+        print(f"修改前格式批处理失败: {e}")
         return False
     
     try:
         x_ref_batch_new, steps_batch_new = binary_collate_fn(batch_new)
-        print("✅ 修改后格式可以正常批处理")
+        print("修改后格式可以正常批处理")
     except Exception as e:
-        print(f"❌ 修改后格式批处理失败: {e}")
+        print(f"修改后格式批处理失败: {e}")
         return False
     
     # 检查批处理结果的兼容性
@@ -133,11 +133,11 @@ def test_data_compatibility():
     mixed_batch = [old_data, new_data]
     try:
         x_ref_mixed, steps_mixed = binary_collate_fn(mixed_batch)
-        print("✅ 混合格式批次可以正常处理")
+        print("混合格式批次可以正常处理")
         print(f"  混合批次 x_ref shape: {x_ref_mixed.shape}")
         print(f"  混合批次 steps count: {len(steps_mixed)}")
     except Exception as e:
-        print(f"❌ 混合格式批次处理失败: {e}")
+        print(f"混合格式批次处理失败: {e}")
         return False
     
     return True
@@ -156,7 +156,7 @@ def test_chunk_loading():
                 chunk_dirs.append((data_type, chunk_dir, len(chunk_files)))
     
     if not chunk_dirs:
-        print("⚠️  未找到现有的chunk文件")
+        print("未找到现有的chunk文件")
         return True
     
     for data_type, chunk_dir, count in chunk_dirs:
@@ -167,27 +167,27 @@ def test_chunk_loading():
         if os.path.exists(first_chunk):
             try:
                 data = torch.load(first_chunk, weights_only=True)
-                print(f"  ✅ 成功加载 {first_chunk}")
-                print(f"  📊 包含 {len(data)} 个对话")
+                print(f"  成功加载 {first_chunk}")
+                print(f"  包含 {len(data)} 个对话")
                 
                 # 检查数据格式
                 if data:
                     sample = data[0]
                     x_ref, steps_data = sample
-                    print(f"  📝 样本格式: x_ref={x_ref.shape}, steps={len(steps_data)}")
+                    print(f"  样本格式: x_ref={x_ref.shape}, steps={len(steps_data)}")
                     
                     # 检查是否有None的x_t（新格式）或都有值（旧格式）
                     none_count = sum(1 for x_t, _, _ in steps_data if x_t is None)
                     total_steps = len(steps_data)
-                    print(f"  🔍 None x_t 比例: {none_count}/{total_steps} ({none_count/total_steps*100:.1f}%)")
+                    print(f"  None x_t 比例: {none_count}/{total_steps} ({none_count/total_steps*100:.1f}%)")
                     
                     if none_count > 0:
-                        print(f"  📋 检测到新格式数据（包含None x_t）")
+                        print(f"  检测到新格式数据（包含None x_t）")
                     else:
-                        print(f"  📋 检测到旧格式数据（无None x_t）")
+                        print(f"  检测到旧格式数据（无None x_t）")
                         
             except Exception as e:
-                print(f"  ❌ 加载失败: {e}")
+                print(f"  加载失败: {e}")
                 return False
     
     return True
@@ -197,20 +197,20 @@ if __name__ == "__main__":
     
     # 测试数据格式兼容性
     if test_data_compatibility():
-        print("\n✅ 数据格式兼容性测试通过")
+        print("\n数据格式兼容性测试通过")
     else:
-        print("\n❌ 数据格式兼容性测试失败")
+        print("\n数据格式兼容性测试失败")
         sys.exit(1)
     
     # 测试现有chunk文件
     if test_chunk_loading():
-        print("\n✅ Chunk文件加载测试通过")
+        print("\nChunk文件加载测试通过")
     else:
-        print("\n❌ Chunk文件加载测试失败")
+        print("\nChunk文件加载测试失败")
         sys.exit(1)
     
-    print("\n🎉 所有兼容性测试通过！")
-    print("\n📋 结论:")
+    print("\n所有兼容性测试通过！")
+    print("\n结论:")
     print("1. 修改后的代码可以处理修改前的数据格式")
     print("2. 新旧格式可以在同一批次中混合处理")
     print("3. 现有的chunk文件可以正常加载")

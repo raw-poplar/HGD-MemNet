@@ -6,36 +6,45 @@ import os
 # 模型维度和结构相关的超参数
 # ------------------------------------
 # --- 内存与性能关键参数 ---
-# 词汇表大小 (由预处理脚本生成，此为占位符) - 实际值基于数据集词汇
+# VOCAB_SIZE: 词汇表大小。
+#   - 实际值由词汇表构建脚本生成（vocabulary.json），此处为默认占位/上限。
+#   - 影响 Embedding 与输出层（分类头）的参数量与显存占用。
 VOCAB_SIZE = 5000
-# 词嵌入维度 (影响模型大小和内存) - 为4G显存调低，建议64-128以平衡性能
+
+# EMBEDDING_DIM: 词嵌入维度。
+#   - 越大表示能力越强，但显存与计算开销成正比；建议在 64–256 之间试验。
+#   - 对应 nn.Embedding(vocab_size, embed_dim)。
 EMBEDDING_DIM = 96
-# 动态神经组隐藏层维度 (影响模型大小和内存) - 为4G显存调低，建议128-256
+
+# DYNAMIC_GROUP_HIDDEN_DIM: 动态神经组隐藏维度（核心状态 h 的大小）。
+#   - 影响动态组（GRU 编码器 + 核心RNN）与注意力（若启用）的维度；
+#   - 若使用多头注意力，需保证 hidden_dim % NUM_ATTENTION_HEADS == 0。
 DYNAMIC_GROUP_HIDDEN_DIM = 192
-# 静态网络隐藏层维度 (影响模型大小和内存) - 为4G显存调低，建议64-128
+
+# STATIC_HEAD_HIDDEN_DIM: 静态决策头的中间层维度。
+#   - 仅影响门控网络与输出网络的中间层宽度，对总参数量影响较 EMBEDDING/隐藏层小。
 STATIC_HEAD_HIDDEN_DIM = 96
 
 
 # --- 其他模型参数 ---
-# 上下文向量维度
+# CONTEXT_VECTOR_DIM: 预留的上下文向量维度（当前实现未直接使用）。
+#   - 如未来引入独立上下文投影/融合，可使用该维度进行约束。
 CONTEXT_VECTOR_DIM = 128
-# 采样比例 (模型内部使用，对内存影响较小)
+
+# 采样比例（用于静态头从动态组隐藏状态中“固定 + 随机”采样的占比）。
+#   - FIXED_SAMPLING_RATIO: 固定采样比例（从前 N 个神经元）；
+#   - RANDOM_SAMPLING_RATIO: 随机采样比例（从余下神经元池中按概率选取）。
+#   - 二者之和不应超过 1.0；实际采样数会取整。
 FIXED_SAMPLING_RATIO = 0.3
 RANDOM_SAMPLING_RATIO = 0.05
 
 # --- 注意力机制配置 ---
-# 注意力头数量配置:
-# 0: 使用纯HGD-MemNet架构（无注意力机制，使用平均池化）
-#    - 适用于计算资源有限的场景
-#    - 保持原始HGD-MemNet的设计理念
-# 1: 使用单头注意力机制（Bahdanau注意力）
-#    - 经典的注意力机制，计算效率高
-#    - 适用于中等规模的模型
-# >1: 使用多头注意力机制
-#    - 现代Transformer风格的多头注意力
-#    - 能够捕获不同类型的依赖关系
-#    - 适用于大规模模型和复杂任务
-ATTENTION_HEADS = 8  # 默认使用8头多头注意力，可根据需要调整为0、1或其他值
+# 关于注意力头数量（NUM_ATTENTION_HEADS）：
+#   - 0: 无注意力（使用历史编码的平均池化作为上下文），速度最快、最省显存；
+#   - 1: 单头 Bahdanau 注意力；
+#   - >=2: 多头注意力（Transformer 风格），注意 DYNAMIC_GROUP_HIDDEN_DIM % NUM_ATTENTION_HEADS == 0。
+# 补充：ATTENTION_HEADS 变量已弃用，仅使用 NUM_ATTENTION_HEADS。
+
 
 
 # ------------------------------------
@@ -51,79 +60,96 @@ UNK_token = 3  # 未知词
 # 训练过程相关的超参数
 # ------------------------------------
 # --- 内存与性能关键参数 ---
-# 逻辑批处理大小。实际GPU处理的大小会是 BATCH_SIZE / GRADIENT_ACCUMULATION_STEPS。 - 为4G显存调低
+# BATCH_SIZE: 逻辑批大小（非等效）。
+#   - 实际每次反向传播等效批次 ≈ BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS；
+#   - 小显存推荐减小 BATCH_SIZE 并增大 GRADIENT_ACCUMULATION_STEPS。
 BATCH_SIZE = 4
-# 梯度累积步骤。用于在不增加内存消耗的情况下模拟更大的批次。 - 相应调高以维持等效批次大小
-# 例如，BATCH_SIZE=4, ACCUMULATION_STEPS=12, 等效批次大小为 48
+
+# GRADIENT_ACCUMULATION_STEPS: 梯度累积步数。
+#   - 例如 BATCH_SIZE=4, ACCUMULATION=12，则等效批次≈48；
+#   - 注意与学习率的相互作用（可适当线性放缩LR）。
 GRADIENT_ACCUMULATION_STEPS = 12
 
-# 新增：低内存模式标志
-LOW_MEMORY_MODE = True  # 如果为True，进一步减小批次大小以适应低端GPU
+# LOW_MEMORY_MODE: 低内存模式。
+#   - True 时自动下调 BATCH_SIZE 并上调累积步，保持等效批次不变。
+LOW_MEMORY_MODE = True
 if LOW_MEMORY_MODE:
     BATCH_SIZE = 2
-    GRADIENT_ACCUMULATION_STEPS = 24  # 保持等效批次大小
+    GRADIENT_ACCUMULATION_STEPS = 24  # 2*24≈48 等效批次大小
 
 
 # --- 其他训练参数 ---
-# 迭代优化训练的“思考步数”
+# THINKING_STEPS: 为每个对话轮设计的“内部思考步数”。
+#   - 数据预处理阶段会为每个目标轮生成若干“思考步”（gate=0）和一个“输出步”（gate=1）；
+#   - 训练时可搭配 USE_GATED_MULTISTEP 早停，模拟“思考到位即输出”。
 THINKING_STEPS = 5
-# 学习率
+
+# LEARNING_RATE: 初始学习率；LR_DECAY_RATE: 轮级别的学习率衰减（train.py中通过StepLR示例）。
 LEARNING_RATE = 0.001
-# 学习率衰减策略 (简单起见，我们先设为固定值，后续可改为衰减)
 LR_DECAY_RATE = 0.95
-# 训练轮次
+
+# NUM_EPOCHS: 总训练轮数；INNER_STEP_LR_DECAY: 同一个batch内部，随思考步 t 衰减学习率的因子。
 NUM_EPOCHS = 20
-# [新增] 内部思考步骤的学习率衰减因子
 INNER_STEP_LR_DECAY = 0.95
 
-# [新增] 温度退火参数
-INITIAL_TEMPERATURE = 1.5  # 初始温度（较高值促进探索），建议1.0-2.0
-TEMPERATURE_DECAY = 0.95  # 每步温度衰减率（<1.0 以逐渐降低随机性），建议0.9-0.99
-MIN_TEMPERATURE = 0.1  # 最小温度阈值，防止过度确定性
+# 温度退火参数（控制 ReservoirRNNCell 的探索→收敛）。
+#   - INITIAL_TEMPERATURE: 初始温度，越高越发散，建议 1.0–2.0；
+#   - TEMPERATURE_DECAY: 每步退火率（<1.0），建议 0.9–0.99；
+#   - MIN_TEMPERATURE: 最小温度下限，防止完全确定性导致停滞。
+INITIAL_TEMPERATURE = 1.5
+TEMPERATURE_DECAY = 0.95
+MIN_TEMPERATURE = 0.1
 
 # ------------------------------------
 # 注意力机制相关参数
 # ------------------------------------
-# 注意力头数量 (0: 纯HGD-MemNet, 1: 单头注意力, >=2: 多头注意力)
+# NUM_ATTENTION_HEADS: 注意力头数量（0/1/多）。
+# ATTENTION_DROPOUT: 注意力权重上的 dropout（防过拟合）；
+# ATTENTION_HEAD_DIM: 单头维度；默认为 None，表示使用 hidden_dim // num_heads；
+# USE_ATTENTION_BIAS: 注意力线性映射是否带偏置；
+# ATTENTION_TEMPERATURE: 注意力温度（softmax 锐度控制）。
+# ATTENTION_TYPE: 注意力类型（"bahdanau"/"dot_product"/"multi_head"）。
 NUM_ATTENTION_HEADS = 1
-
-# 多头注意力相关参数
-ATTENTION_DROPOUT = 0.1  # 注意力dropout率
-ATTENTION_HEAD_DIM = None  # 每个注意力头的维度，None表示自动计算 (hidden_dim // num_heads)
-USE_ATTENTION_BIAS = True  # 是否在注意力计算中使用偏置
-ATTENTION_TEMPERATURE = 1.0  # 注意力温度参数，用于控制注意力分布的锐度
-
-# 注意力机制类型选择
-ATTENTION_TYPE = "bahdanau"  # 可选: "bahdanau", "dot_product", "multi_head"
+ATTENTION_DROPOUT = 0.1
+ATTENTION_HEAD_DIM = None
+USE_ATTENTION_BIAS = True
+ATTENTION_TEMPERATURE = 1.0
+ATTENTION_TYPE = "bahdanau"
 
 
 # ------------------------------------
 # 验证与模型保存
 # ------------------------------------
-# 每N个更新步数后进行一次验证
+# VALIDATE_EVERY_N_STEPS: 每 N 个“内部步”后在验证集上评估一次（频繁会减慢训练）。
 VALIDATE_EVERY_N_STEPS = 200
 
-# 保存最佳模型的目录
+# BEST_MODEL_DIR: 保存验证集最优模型权重的目录。
 BEST_MODEL_DIR = "./best_model"
 
 
 # ------------------------------------
-# 门控和输出逻辑相关的超参数
+# 门控与输出逻辑
 # ------------------------------------
-# 门控网络的输出阈值
+# GATE_THRESHOLD: 门控网络判定“输出”的阈值（0~1）。越高越保守，越低越激进。
 GATE_THRESHOLD = 0.8
+
+# USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
+USE_SOFT_TOPK_TRAINING = True
+
+# USE_GATED_MULTISTEP: 是否启用“门控多步思考”早停（训练循环中当 gate>=阈值时提前跳出该样本的内部步）。
+USE_GATED_MULTISTEP = False
 
 
 # ------------------------------------
 # 检查点 (Checkpoint) 相关设置
 # ------------------------------------
-# 保存检查点的目录
+# CHECKPOINT_DIR: 训练过程中的通用检查点目录（包含最近若干轮/步权重）。
 CHECKPOINT_DIR = "./checkpoints"
 
-# 每处理多少个批次(batch)的数据后就保存一次检查点
+# SAVE_CHECKPOINT_EVERY_N_BATCHES: 每处理多少个 batch（内部步聚合后的单位）保存一次检查点。
 SAVE_CHECKPOINT_EVERY_N_BATCHES = 300
 
-# 最多保留多少个最新的检查点文件
+# MAX_CHECKPOINTS_TO_KEEP: 最多保留的检查点个数（滚动删除旧的）。
 MAX_CHECKPOINTS_TO_KEEP = 5
 
 
@@ -139,20 +165,23 @@ PROCESSED_DATA_PATH_CORNELL = "./data/cornell_processed/processed_dialogues.json
 
 
 # --- LCCC 中文对话数据集 ---
-# 原始数据路径 - 建议使用环境变量或相对路径
-dataset_path = os.environ.get('DATASET_PATH', 'F:/modelTrain')  # 使用您的实际路径
+# 可通过环境变量 DATASET_PATH 覆盖默认根路径；建议使用相对路径或外部磁盘路径。
+# 示例：在 PowerShell 中可设：$env:DATASET_PATH="D:/datasets"
+# 原始 LCCC 文件命名可根据你的实际下载情况调整。
+
+dataset_path = os.environ.get('DATASET_PATH', 'F:/modelTrain')
 LCCC_RAW_PATH = os.path.join(dataset_path, 'LCCC')
 LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.json')
 LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.json')
 LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.json')
 
-# 处理后的数据保存路径 - 根据您的项目结构修正路径
+# 处理后的数据保存路径（预处理脚本输出目录）。
 LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data', 'lccc_processed')
 
 
-# 最小和最大对话长度（按句子数）
+# 最小与最大对话长度（按句子计数），用于数据清洗或过滤。
 MIN_CONVO_LENGTH = 2
-MAX_CONVO_LENGTH = 25 
+MAX_CONVO_LENGTH = 25
 
 
 # ------------------------------------

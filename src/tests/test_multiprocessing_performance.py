@@ -11,7 +11,7 @@ import sys
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from src.dataset import Vocabulary
-from src.prepare_binary_data import process_dialogue_to_tensors, init_worker, process_batch_optimized
+from src.data_processing.prepare_binary_data import process_dialogue_to_tensors, init_worker, process_batch_optimized
 from multiprocessing import Pool, cpu_count
 
 def create_test_data(num_dialogues=1000):
@@ -29,7 +29,7 @@ def create_test_data(num_dialogues=1000):
 
 def test_single_thread(test_data, vocab):
     """测试单线程性能"""
-    print("🔄 测试单线程性能...")
+    print("测试单线程性能...")
     start_time = time.time()
     
     results = []
@@ -46,12 +46,12 @@ def test_single_thread(test_data, vocab):
     duration = end_time - start_time
     speed = len(test_data) / duration
     
-    print(f"   ✅ 单线程: {len(results)} 个对话, 用时 {duration:.2f}s, 速度 {speed:.1f} it/s")
+    print(f"   单线程: {len(results)} 个对话, 用时 {duration:.2f}s, 速度 {speed:.1f} it/s")
     return results, speed
 
 def test_new_multithread(test_data, vocab, num_workers=4):
     """测试新的多线程实现"""
-    print(f"🔄 测试新多线程性能 (workers={num_workers})...")
+    print(f"测试新多线程性能 (workers={num_workers})...")
     
     start_time = time.time()
     
@@ -72,12 +72,12 @@ def test_new_multithread(test_data, vocab, num_workers=4):
     duration = end_time - start_time
     speed = len(test_data) / duration
     
-    print(f"   ✅ 新多线程: {len(results)} 个对话, 用时 {duration:.2f}s, 速度 {speed:.1f} it/s")
+    print(f"   新多线程: {len(results)} 个对话, 用时 {duration:.2f}s, 速度 {speed:.1f} it/s")
     return results, speed
 
 def test_scaling_performance():
     """测试不同worker数量的性能"""
-    print("\n📊 测试不同worker数量的性能...")
+    print("\n测试不同worker数量的性能...")
     
     # 创建测试数据
     test_data = create_test_data(2000)
@@ -92,9 +92,9 @@ def test_scaling_performance():
         except:
             pass
     
-    print(f"📝 测试数据: {len(test_data)} 个对话")
-    print(f"📚 词汇表大小: {vocab.num_words}")
-    print(f"💻 可用CPU: {cpu_count()}")
+    print(f"测试数据: {len(test_data)} 个对话")
+    print(f"词汇表大小: {vocab.num_words}")
+    print(f"可用CPU: {cpu_count()}")
     
     # 测试单线程
     _, single_speed = test_single_thread(test_data, vocab)
@@ -112,13 +112,13 @@ def test_scaling_performance():
                 _, new_speed = test_new_multithread(test_data, vocab, workers)
                 new_speeds.append(new_speed)
             except Exception as e:
-                print(f"   ❌ 新多线程失败: {e}")
+                print(f"   新多线程失败: {e}")
                 new_speeds.append(0)
         else:
             new_speeds.append(0)
     
     # 性能总结
-    print(f"\n📈 性能总结:")
+    print(f"\n性能总结:")
     print(f"{'Workers':<8} {'单线程':<12} {'新多线程':<12} {'提升倍数':<10}")
     print("-" * 50)
     
@@ -133,7 +133,7 @@ def test_scaling_performance():
 
 def analyze_bottlenecks():
     """分析性能瓶颈"""
-    print(f"\n🔍 性能瓶颈分析:")
+    print(f"\n性能瓶颈分析:")
     
     # 测试序列化开销
     vocab = Vocabulary("test")
@@ -144,7 +144,7 @@ def analyze_bottlenecks():
     for _ in range(1000):
         pickle.dumps(vocab)
     serialize_time = time.time() - start_time
-    print(f"   📦 词汇表序列化开销: {serialize_time*1000:.2f}ms/1000次")
+    print(f"   词汇表序列化开销: {serialize_time*1000:.2f}ms/1000次")
     
     # 测试JSON解析开销
     test_line = json.dumps([{"text": "hello world"}, {"text": "how are you"}])
@@ -152,7 +152,7 @@ def analyze_bottlenecks():
     for _ in range(1000):
         json.loads(test_line)
     json_time = time.time() - start_time
-    print(f"   📄 JSON解析开销: {json_time*1000:.2f}ms/1000次")
+    print(f"   JSON解析开销: {json_time*1000:.2f}ms/1000次")
     
     # 测试张量创建开销
     import torch
@@ -160,10 +160,10 @@ def analyze_bottlenecks():
     for _ in range(1000):
         torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
     tensor_time = time.time() - start_time
-    print(f"   🔢 张量创建开销: {tensor_time*1000:.2f}ms/1000次")
+    print(f"   张量创建开销: {tensor_time*1000:.2f}ms/1000次")
 
 if __name__ == "__main__":
-    print("🚀 多进程性能测试开始...")
+    print("多进程性能测试开始...")
     
     try:
         # 性能测试
@@ -173,26 +173,26 @@ if __name__ == "__main__":
         analyze_bottlenecks()
         
         # 结论
-        print(f"\n🎯 结论:")
+        print(f"\n结论:")
         if new_speeds and max(new_speeds) > 0:
             best_new = max(new_speeds)
             
             if best_new > single_speed * 1.5:
-                print(f"✅ 新多线程实现显著优于单线程 ({best_new:.1f} vs {single_speed:.1f} it/s)")
+                print(f"新多线程实现显著优于单线程 ({best_new:.1f} vs {single_speed:.1f} it/s)")
             elif best_new > single_speed * 1.2:
-                print(f"✅ 新多线程实现有效提升性能 ({best_new:.1f} vs {single_speed:.1f} it/s)")
+                print(f"新多线程实现有效提升性能 ({best_new:.1f} vs {single_speed:.1f} it/s)")
             else:
-                print(f"⚠️  多线程提升有限，建议使用单线程")
+                print(f"多线程提升有限，建议使用单线程")
                 
             # 推荐配置
             best_workers = new_speeds.index(max(new_speeds)) + 1
             if best_workers <= len([1, 2, 4, 8]):
                 actual_workers = [1, 2, 4, 8][best_workers - 1]
-                print(f"💡 推荐使用 {actual_workers} 个worker进程")
+                print(f"推荐使用 {actual_workers} 个worker进程")
         else:
-            print(f"❌ 多线程测试失败")
+            print(f"多线程测试失败")
             
     except Exception as e:
-        print(f"❌ 测试失败: {e}")
+        print(f"测试失败: {e}")
         import traceback
         traceback.print_exc()
