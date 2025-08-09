@@ -15,7 +15,7 @@ cudnn.benchmark = True  # 启用 cudnn 基准测试以加速
 import config
 from .model import HGD_MemNet
 from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
-from .utils import compute_loss  # 新增：导入工具函数
+from .utils import compute_loss, set_seed  # 新增：导入工具函数与随机种子
 import logging  # 新增：日志记录
 
 # 设置日志
@@ -32,6 +32,7 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     """
     按照描述进行训练：在每个“思考步骤”中都进行一次损失计算和反向传播，
     并动态调整学习率。
+    返回：batch_loss, steps_updated(思考步数), gate_mean, gate_entropy, cap_hit(0/1)
     """
     model.train()
     x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
@@ -39,6 +40,10 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     batch_size = x_ref_padded.size(0)
     total_batch_loss = 0.0
     steps_updated = 0
+    gate_mean_acc = 0.0
+    gate_entropy_acc = 0.0
+    gate_obs = 0
+    ended_by_cap = False
 
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
@@ -48,7 +53,17 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     initial_temperature = config.INITIAL_TEMPERATURE
     temperature_decay = config.TEMPERATURE_DECAY
 
-    for t in range(len(steps_data)):
+    # 自适应思考：解析最小/最大思考步（-1 表示不限制）
+    min_t = getattr(config, 'MIN_THINKING_STEPS', -1)
+    max_t = getattr(config, 'MAX_THINKING_STEPS', -1)
+    min_t = None if min_t is None or min_t < 0 else int(min_t)
+    max_t = None if max_t is None or max_t < 0 else int(max_t)
+
+    steps_available = len(steps_data)
+    # 在不改动数据管线的前提下，cap 不能超过提供的 steps；若 max_t 为 None 则使用 steps_available
+    cap = min(steps_available, max_t) if max_t is not None else steps_available
+
+    for t in range(steps_available):
         x_t_padded, target_padded, gate_target = steps_data[t]
         x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
         gate_target = gate_target.to(DEVICE, non_blocking=True)
@@ -65,8 +80,29 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         optimizer.zero_grad()
 
         with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature)
-            step_loss = compute_loss(gate_pred, gate_target, output_logits, target_padded)
+            # 构造控制向量（时机意识）：t_norm, remain_norm, min_done, target_speak_ratio
+            t_norm = torch.full((batch_size, 1), (t + 1) / max(cap, 1), device=DEVICE)
+            remain_norm = torch.full((batch_size, 1), max(cap - (t + 1), 0) / max(cap, 1), device=DEVICE)
+            min_done = torch.full((batch_size, 1), 1.0 if (min_t is not None and (t + 1) >= min_t) or (min_t is None) else 0.0, device=DEVICE)
+            budget = torch.full((batch_size, 1), float(getattr(config, 'TARGET_SPEAK_RATIO', 0.0) or 0.0), device=DEVICE)
+            control = torch.cat([t_norm, remain_norm, min_done, budget], dim=1)
+
+            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature, control=control)
+
+            # 统计门控均值/熵
+            gate_mean_acc += float(gate_pred.mean().item())
+            p = torch.clamp(gate_pred, 1e-6, 1 - 1e-6)
+            gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
+            gate_obs += 1
+
+            step_loss = compute_loss(
+                gate_pred, gate_target, output_logits, target_padded,
+                gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                h_prev=h_prev, h_next=h_next,
+                think_loss_weight=getattr(config, 'THINK_LOSS_WEIGHT', 0.0),
+                info_nce_tau=getattr(config, 'THINK_INFO_TAU', 0.1),
+            )
 
         scaler.scale(step_loss).backward()
         scaler.unscale_(optimizer)
@@ -78,10 +114,16 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         h_prev = h_next.detach()
         steps_updated += 1
 
-        # 基于门控的多步思考早停（开关）
+        # 基于门控的多步思考早停（需达到最小思考步才生效）
         if getattr(config, 'USE_GATED_MULTISTEP', False):
-            if (gate_pred.mean().item() >= config.GATE_THRESHOLD):
+            reached_min = (min_t is None) or ((t + 1) >= min_t)
+            if reached_min and (gate_pred.mean().item() >= config.GATE_THRESHOLD):
                 break
+
+        # 达到最大思考步上限（cap）则强制停止本样本的内部思考
+        if (t + 1) >= cap:
+            ended_by_cap = True
+            break
 
     for i, param_group in enumerate(optimizer.param_groups):
         param_group['lr'] = original_lrs[i]
@@ -92,7 +134,45 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
         #   if USE_GATED_MULTISTEP and gate_pred >= GATE_THRESHOLD:
         #       break  # 提前终止内部步，模拟“已决定输出”
 
-    return total_batch_loss, steps_updated
+    # 计算门控统计
+    gate_mean = (gate_mean_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
+    gate_entropy = (gate_entropy_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
+
+    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap)
+
+# 剪枝/再生长：按配置周期触发（最小实现，模块级函数）
+def maybe_prune_regrow(model, total_steps):
+    try:
+        if not getattr(config, 'PRUNE_ENABLE', False):
+            return
+        if total_steps < getattr(config, 'PRUNE_START_STEPS', 0):
+            return
+        if total_steps % max(1, getattr(config, 'PRUNE_EVERY_STEPS', 1000)) != 0:
+            return
+        cell = getattr(getattr(model, 'dynamic_group', None), 'core_rnn', None)
+        if cell is None or not hasattr(cell, 'hh_mask'):
+            return
+        # 记录剪枝前非零数
+        with torch.no_grad():
+            before_nz = int(cell.hh_mask.sum().item())
+        # 剪枝
+        cell.prune_by_magnitude(
+            sparsity_step=getattr(config, 'PRUNE_SPARSE_STEP', 0.05),
+            min_keep=getattr(config, 'PRUNE_MIN_KEEP', 4),
+        )
+        # 再生长（可选）
+        if getattr(config, 'REGROW_ENABLE', False):
+            cell.regrow_by_hebb(
+                per_row=getattr(config, 'REGROW_PER_ROW', 1),
+                init_std=getattr(config, 'REGROW_INIT_STD', 1e-3),
+            )
+        # 记录剪枝后非零数
+        with torch.no_grad():
+            after_nz = int(cell.hh_mask.sum().item())
+        logging.info(f"[sparsify] step={total_steps} nnz: {before_nz}->{after_nz}")
+    except Exception as e:
+        logging.warning(f"剪枝/再生长触发失败: {e}")
+
 
 def validate_model(model):
     """验证模型，只计算损失。"""
@@ -135,10 +215,14 @@ def validate_model(model):
                 g_t = g_t.to(DEVICE, non_blocking=True)
 
                 # 新增：在验证时使用低温
-                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温
+                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温（验证不传 control）
 
-                # 使用 utils 中的 compute_loss
-                step_loss = compute_loss(gate_pred, g_t, output_logits, y_t)
+                # 使用 utils 中的 compute_loss（验证阶段不加思考对比项，避免方差）
+                step_loss = compute_loss(
+                    gate_pred, g_t, output_logits, y_t,
+                    gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                    target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                )
 
                 total_val_loss += step_loss.item()
                 h_prev = h_next
@@ -213,8 +297,9 @@ def train_model():
         print(f"词汇表加载完毕。大小: {vocab.num_words}")
 
         # 新增：启用 TF32 以加速（Ampere+ GPU）
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and getattr(config, 'ALLOW_TF32', True):
             torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         model = HGD_MemNet(
             vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
@@ -248,6 +333,39 @@ def train_model():
         # 新增：全局学习率调度器
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)  # 每轮衰减
 
+        # 统一随机种子（如设置）
+        from datetime import datetime
+        if getattr(config, 'SEED', None) is not None:
+            set_seed(config.SEED, getattr(config, 'DETERMINISTIC', False))
+        else:
+            # 若未指定，仍可记录一次性随机种子，便于复现
+            try:
+                seed_now = int(datetime.now().timestamp())
+                set_seed(seed_now, False)
+                print(f"本次运行随机种子: {seed_now}")
+            except Exception:
+                pass
+
+        # TensorBoard/CSV 记录器初始化（可选）
+        writer = None
+        if getattr(config, 'USE_TENSORBOARD', False):
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                writer = SummaryWriter(log_dir=getattr(config, 'TENSORBOARD_LOG_DIR', './runs'))
+            except Exception as e:
+                print(f"TensorBoard 初始化失败: {e}")
+                writer = None
+        csv_f = None
+        csv_writer = None
+        if getattr(config, 'USE_CSV_LOGGER', False):
+            os.makedirs(os.path.dirname(getattr(config, 'CSV_LOG_PATH', './logs/train_metrics.csv')), exist_ok=True)
+            import csv
+            csv_f = open(getattr(config, 'CSV_LOG_PATH', './logs/train_metrics.csv'), 'a', newline='', encoding='utf-8')
+            csv_writer = csv.writer(csv_f)
+            # 写入表头（若为空）
+            if csv_f.tell() == 0:
+                csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean'])
+
         for epoch in range(start_epoch, config.NUM_EPOCHS):
             train_dataset = BinaryDialogueDataset(train_data_dir)
             # 注意：不再需要除以梯度累积步数
@@ -265,7 +383,7 @@ def train_model():
             pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
 
             for x_ref_padded, steps_data in pbar:
-                batch_loss, steps_in_batch = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
+                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
 
                 total_steps += steps_in_batch
                 avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
@@ -273,7 +391,22 @@ def train_model():
                     "平均步损失": f"{avg_loss:.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                     "总更新步数": total_steps,
+                    "门控均值": f"{gate_mean:.3f}",
+                    "cap触发": cap_hit,
                 })
+
+                # 记录指标
+                if writer is not None:
+                    writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                    writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
+                    writer.add_scalar('train/gate_mean', gate_mean, total_steps)
+                    writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
+                    writer.add_scalar('train/cap_hit', cap_hit, total_steps)
+                if csv_writer is not None:
+                    csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
+
+                # 动态稀疏：周期性触发剪枝/再生长
+                maybe_prune_regrow(model, total_steps)
 
                 if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                     save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
@@ -292,6 +425,14 @@ def train_model():
             print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
         print("\n训练全部完成！")
         logging.info("训练完成")
+        # 关闭记录器
+        try:
+            if writer is not None:
+                writer.close()
+            if csv_f is not None:
+                csv_f.close()
+        except Exception:
+            pass
     except Exception as e:
         logging.error(f"训练出错: {e}")
         raise

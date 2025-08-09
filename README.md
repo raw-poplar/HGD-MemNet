@@ -250,6 +250,32 @@ python -m src.train
 python -m src.data_processing.prepare_binary_data --num_workers=4
 ```
 
+#### 可选：自适应思考与动态稀疏（高级）
+- 运行时控制思考步长：`MIN_THINKING_STEPS / MAX_THINKING_STEPS`（-1 表示不限制），推理见“与模型聊天/评估”章节
+- 训练中启用剪枝+再生长：在 `config.py` 设置：
+  - `PRUNE_ENABLE=True`，`REGROW_ENABLE=True`
+  - `PRUNE_START_STEPS=2000`，`PRUNE_EVERY_STEPS=1000`，`PRUNE_SPARSE_STEP=0.05`，`PRUNE_MIN_KEEP=4`
+  - `REGROW_PER_ROW=1`，`REGROW_INIT_STD=1e-3`，`HEBB_EMA_BETA=0.9`
+- 日志（TensorBoard/CSV）将记录：`avg_step_loss`、`lr`、`gate_mean`、`gate_entropy`、`cap_hit` 与稀疏事件日志
+
+
+#### 自适应思考步长与门控机制详解
+- MIN_THINKING_STEPS / MAX_THINKING_STEPS：分别是“最少思考步数”和“最多思考步数”（-1 表示不限制）。
+  - 推理：当达到 `MIN_THINKING_STEPS` 后若 `gate_pred >= GATE_THRESHOLD` 则触发输出；达到 `MAX_THINKING_STEPS` 则强制输出（即便 gate 偏低）。
+  - 训练：建议用“软门控/直通”优化 gate；验证/推理用硬阈值。
+- GATE_THRESHOLD：门控阈值（0~1）。越高表示更保守（更愿意多思考），越低表示更激进（更快发声）。
+- control（时机意识）向量：模型 forward 可接收 [t_norm, remain_norm, min_done, target_speak_ratio] 辅助门控判断更稳健。可通过 `CONTROL_GATE_ALPHA>0` 让其与 gate_pred 融合（默认关闭）。
+- 建议：配合“饥饿式/饱腹式”训练（随机化 min/max 或预算），提升模型在不同深度下的稳定性。
+
+#### 动态稀疏（剪枝 + 再生长）与赫布定律
+- 剪枝：对动态神经组的可训练连接矩阵 W_hh 进行按幅值小步剪枝，行内保底（`PRUNE_MIN_KEEP`）。
+- 再生长：基于赫布分数（|h_next|⊗|h_prev| 的 EMA）在被剪位置选择“最相关”的若干连接复活，并以小随机值初始化。
+- 周期：训练中按 `PRUNE_START_STEPS` 暖身后，每 `PRUNE_EVERY_STEPS` 触发一次；每次新增剪除比例 `PRUNE_SPARSE_STEP`；再生长用 `REGROW_PER_ROW` 控制。
+- 监控：在 TensorBoard/CSV 观察 `gate_mean`、`gate_entropy`、`cap_hit`，在 train.log 观察 [sparsify] 记录的 nnz 变化。
+- 调参建议：
+  - 起步：`PRUNE_SPARSE_STEP=0.05`、`PRUNE_MIN_KEEP=4`、`REGROW_PER_ROW=1`、`HEBB_EMA_BETA=0.9`
+  - 若出现性能波动：降低剪枝频率/比例；剪后短时提高温度；增大门控熵正则。
+
 
 提示:
 - 默认启用温度退火（config.INITIAL_TEMPERATURE, TEMPERATURE_DECAY, MIN_TEMPERATURE）
@@ -264,7 +290,8 @@ python -m src.data_processing.prepare_binary_data --num_workers=4
 运行评估脚本来测试模型在测试集上的性能。
 
 ```bash
-python -m src.evaluate
+# 支持自适应思考步长参数（-1 表示不限制）
+python -m src.evaluate --checkpoint best_model/best_model.pth --data_dir <processed_test_dir> --min-think 1 --max-think 8
 ```
 
 ### 7. 与模型聊天
@@ -272,7 +299,8 @@ python -m src.evaluate
 使用 `chat.py` 脚本与您训练好的最佳模型进行交互。
 
 ```bash
-python -m src.chat  # 命令行交互
+# 运行时控制最小/最大思考步数与温度（-1 表示不限制）
+python -m src.chat --min-think 1 --max-think 8 --temp 0.8
 
 # 或者使用 Web 接口：
 streamlit run src/chat_web.py  # Web 演示

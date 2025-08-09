@@ -84,6 +84,16 @@ if LOW_MEMORY_MODE:
 #   - 训练时可搭配 USE_GATED_MULTISTEP 早停，模拟“思考到位即输出”。
 THINKING_STEPS = 5
 
+# 说明：若使用自适应思考（MIN/MAX_THINKING_STEPS），THINKING_STEPS 作为数据侧“思考步的最大规划参考”，
+# 实际训练中是否提前/延后由门控与 MIN/MAX 决定。
+
+
+# 新增：自适应思考步数（-1 表示不限制；训练/推理时可运行时覆盖）
+MIN_THINKING_STEPS = -1
+MAX_THINKING_STEPS = -1
+# 安全兜底，防止极端情况下长时间不发声
+SAFETY_MAX_THINKING_STEPS = 64
+
 # LEARNING_RATE: 初始学习率；LR_DECAY_RATE: 轮级别的学习率衰减（train.py中通过StepLR示例）。
 LEARNING_RATE = 0.001
 LR_DECAY_RATE = 0.95
@@ -114,7 +124,27 @@ ATTENTION_DROPOUT = 0.1
 ATTENTION_HEAD_DIM = None
 USE_ATTENTION_BIAS = True
 ATTENTION_TEMPERATURE = 1.0
+# 训练与推理的“时机意识”控制向量（control）
+#   - t_norm: 当前思考步 / cap；remain_norm: 剩余步 / cap；min_done: 是否达最小步；budget: 目标发声比例
+#   - CONTROL_GATE_ALPHA: 若 >0，会用 control 的压缩信息与 gate_pred 做凸组合（无参数微调），默认关闭
+
 ATTENTION_TYPE = "bahdanau"
+
+
+# ------------------------------------
+# 随机性与日志设置
+# ------------------------------------
+# 随机种子（None 表示不固定）与确定性选项
+SEED = None
+DETERMINISTIC = False
+# 允许 TF32（Ampere+ GPU 上建议开启以加速）
+ALLOW_TF32 = True
+
+# 日志与可视化
+USE_TENSORBOARD = False
+TENSORBOARD_LOG_DIR = "./runs"
+USE_CSV_LOGGER = True
+CSV_LOG_PATH = "./logs/train_metrics.csv"
 
 
 # ------------------------------------
@@ -130,13 +160,46 @@ BEST_MODEL_DIR = "./best_model"
 # ------------------------------------
 # 门控与输出逻辑
 # ------------------------------------
-# GATE_THRESHOLD: 门控网络判定“输出”的阈值（0~1）。越高越保守，越低越激进。
+# GATE_THRESHOLD: 门控网络判定“输出”的阈值（0~1）。
+#   - 语义：当 gate_pred >= GATE_THRESHOLD 且达到 MIN_THINKING_STEPS 时，模型触发“说话”；否则继续“思考”。
+#   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
+#   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
+#   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
 GATE_THRESHOLD = 0.8
 
 # USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
 USE_SOFT_TOPK_TRAINING = True
 
+
+# 门控正则与思考损失（可选）
+# 目标发声比例（用于预算正则，不是硬约束）
+TARGET_SPEAK_RATIO = 0.2
+# 门控熵正则权重（鼓励适度不确定性，防止塌缩）
+GATE_ENTROPY_WEIGHT = 1e-3
+# 思考信息量损失（InfoNCE 等）的权重（0 表示关闭）
+THINK_LOSS_WEIGHT = 0.0
+# InfoNCE 温度
+THINK_INFO_TAU = 0.1
+# 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
+CONTROL_GATE_ALPHA = 0.0
+
+
 # USE_GATED_MULTISTEP: 是否启用“门控多步思考”早停（训练循环中当 gate>=阈值时提前跳出该样本的内部步）。
+# ------------------------------------
+# 剪枝与再生长（动态稀疏）设置
+# ------------------------------------
+PRUNE_ENABLE = False           # 开关：是否启用训练中剪枝
+PRUNE_START_STEPS = 2000       # 从第多少个总更新步开始剪枝（暖身）
+PRUNE_EVERY_STEPS = 1000       # 每多少个总更新步进行一次剪枝
+PRUNE_SPARSE_STEP = 0.05       # 每次新增剪枝比例（相对于当前激活连接的比例）
+PRUNE_MIN_KEEP = 4             # 每行（每个输出神经元）至少保留的连接数
+
+REGROW_ENABLE = False          # 开关：是否在剪枝后再生长
+REGROW_PER_ROW = 1             # 每行再生长的连接数
+REGROW_INIT_STD = 1e-3         # 新生连接权重初始化标准差
+
+HEBB_EMA_BETA = 0.9            # 赫布分数的EMA系数（越大越平滑）
+
 USE_GATED_MULTISTEP = False
 
 
@@ -188,4 +251,4 @@ MAX_CONVO_LENGTH = 25
 # 二进制数据处理
 # ------------------------------------
 # 在内存中一次处理的对话数量，用于生成二进制数据块 - 减小以适应内存
-CHUNK_SIZE = 20000 
+CHUNK_SIZE = 20000

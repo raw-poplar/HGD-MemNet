@@ -154,9 +154,9 @@ class ReservoirRNNCell(nn.Module):
     def __init__(self, input_size, hidden_size, initial_temperature=1.0, use_hard_sampling=False):
         """
         初始化 ReservoirRNNCell：高级版带有温度采样的可训练RNN单元，模拟概率驱动的数据交换。
-        
+
         新增：initial_temperature - 初始温度参数。
-        
+
         Args:
             input_size (int): 输入维度。
             hidden_size (int): 隐藏状态维度（神经元数量）。
@@ -172,11 +172,14 @@ class ReservoirRNNCell(nn.Module):
         # 可训练权重矩阵：(hidden_out, hidden_in)，每个行代表一个输出神经元的出边权重到输入神经元。
         self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
         init.xavier_uniform_(self.W_hh_matrix)  # 优化初始化 for 稳定性
-    
+        # 剪枝与再生长：连接掩码与赫布分数缓冲
+        self.register_buffer("hh_mask", torch.ones(hidden_size, hidden_size))
+        self.register_buffer("hebb_score", torch.zeros(hidden_size, hidden_size))
+
     def forward(self, x_t, h_prev, temperature=None):
         """
         前向传播：高级版使用温度调整的 Gumbel-Softmax 采样更新隐藏状态。
-        
+
         高级特性：
         - 支持动态温度（通过可选参数传入，覆盖 self.temperature）。
         - 可切换硬/软采样：硬采样 (hard=True) 生成离散 one-hot 向量（适合推理）；软采样 (hard=False) 生成连续近似（适合训练，反向传播友好）。
@@ -184,27 +187,27 @@ class ReservoirRNNCell(nn.Module):
         - 影响：高温τ增加熵（多样性），低温τ减少熵（确定性）。如果τ→0，退化为 argmax（需小心除零）。
         - 边缘处理：如果 temperature <=0，使用 argmax 作为近似硬采样。
         - 警告：高温 (tau >1) 可能增加训练方差，导致不稳定；建议从小值开始实验。
-        
+
         逻辑：
         1. 计算输入贡献 (不变)。
         2. 准备 logits - 应用温度缩放 (1, hidden_out, hidden_in)。
         3. 使用 Gumbel-Softmax 进行可微采样（重复到批次维度）。
         4. 计算每个输出神经元的贡献：采样权重与 h_prev 的加权和（使用 einsum 高效实现）。
         5. 组合输入贡献并应用 tanh 激活生成 h_next。
-        
+
         这实现了概率数据交换：高温增加低概率连接的选中率，促进探索；低温偏向高概率连接，确保稳定性。
         Gumbel-Softmax 确保采样过程可微，便于端到端训练。
-        
+
         Args:
             x_t (torch.Tensor): 当前输入，shape: (batch_size, input_size)
             h_prev (torch.Tensor): 上一步隐藏状态，shape: (batch_size, hidden_size)
             temperature (float, optional): 覆盖 self.temperature 的动态温度。默认None（使用 self.temperature）。
-        
+
         Returns:
             h_next (torch.Tensor): 新隐藏状态，shape: (batch_size, hidden_size)
         """
         batch_size = h_prev.size(0)
-        
+
         # 使用动态温度，如果提供；否则使用可学习的实例温度（保持可导）
         if temperature is not None:
             tau_tensor = torch.as_tensor(temperature, device=h_prev.device, dtype=self.W_hh_matrix.dtype)
@@ -222,12 +225,13 @@ class ReservoirRNNCell(nn.Module):
 
         if self.training:
             hard = False  # 训练时强制软采样，确保梯度平滑
-        
+
         # 步骤1: 计算输入到隐藏的贡献 (batch, hidden)
         input_contrib = self.W_ih(x_t)
-        
+
         # 步骤2: 准备 logits - 应用温度缩放 (1, hidden_out, hidden_in)
-        logits = (self.W_hh_matrix / tau_tensor).unsqueeze(0)
+        effective = (self.W_hh_matrix * self.hh_mask) / tau_tensor
+        logits = effective.unsqueeze(0)
 
         # 步骤3: 矢量化 Gumbel-Softmax 采样 - 重复到批次维度 (batch, hidden_out, hidden_in)
         # 公式: y_i = softmax((log π_i + g_i) / τ)
@@ -239,10 +243,72 @@ class ReservoirRNNCell(nn.Module):
             contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)  # 替代以加速大矩阵
         else:
             contrib = torch.einsum('boh,bh->bo', gumbel_samples, h_prev)
-        
-        # 步骤5: 组合并激活
-        h_next = torch.tanh(input_contrib + contrib)
-        
+
+        # 步骤5：计算 h_next（用于前向与赫布统计）
+        h_preact = input_contrib + contrib
+        h_next = torch.tanh(h_preact)
+
+        # 赫布分数累计：只在训练态统计 |h_prev|·|h_next| 的EMA
+        if self.training:
+            with torch.no_grad():
+                pre = h_prev.abs()
+                post = h_next.abs()
+                hebb_batch = torch.einsum('bo,bh->oh', post, pre) / max(1, h_prev.size(0))
+                beta = getattr(config, 'HEBB_EMA_BETA', 0.9)
+                self.hebb_score.mul_(beta).add_((1.0 - beta) * hebb_batch)
+
+        return h_next
+
+    def prune_by_magnitude(self, sparsity_step=0.05, min_keep=4):
+        """按幅值剪枝（每次新增剪除一定比例），保留每行至少 min_keep 个连接。"""
+        with torch.no_grad():
+            W_eff = (self.W_hh_matrix * self.hh_mask).abs()
+            # 只在当前激活的连接里做排序
+            active_vals = W_eff[self.hh_mask > 0]
+            if active_vals.numel() == 0:
+                return
+            k = max(1, int(active_vals.numel() * sparsity_step))
+            thresh = torch.topk(active_vals, k=k, largest=False).values.max()
+            # 先标记剪枝
+            new_mask = self.hh_mask.clone()
+            new_mask[(W_eff <= thresh) & (self.hh_mask > 0)] = 0.0
+            # 行保底
+            row_nz = new_mask.sum(dim=1)
+            need = (row_nz < min_keep).nonzero(as_tuple=True)[0]
+            if need.numel() > 0:
+                for i in need.tolist():
+                    # 在该行按幅值选择 top min_keep
+                    topk_idx = torch.topk(W_eff[i], k=min_keep).indices
+                    new_mask[i].zero_()
+                    new_mask[i, topk_idx] = 1.0
+            self.hh_mask.copy_(new_mask)
+
+    def regrow_by_hebb(self, per_row=1, init_std=1e-3):
+        """按赫布分数在被剪枝位置里每行再生长若干连接。"""
+        if per_row <= 0:
+            return
+        with torch.no_grad():
+            pruned = (self.hh_mask == 0)
+            if pruned.sum() == 0:
+                return
+            score = self.hebb_score.clone()
+            # 只在 pruned 集合上挑分数最高的 per_row 个
+            score[~pruned] = -1e9
+            topk_vals, topk_idx = torch.topk(score, k=per_row, dim=1)
+            self.hh_mask.scatter_(1, topk_idx, 1.0)
+            # 初始化新生权重为小值
+            noise = torch.randn_like(topk_vals) * init_std
+            self.W_hh_matrix.scatter_(1, topk_idx, noise)
+
+        # 赫布分数累计：只在训练态统计 |h_prev|·|h_next| 的EMA
+        if self.training:
+            with torch.no_grad():
+                pre = h_prev.abs()
+                post = h_next.abs()
+                hebb_batch = torch.einsum('bo,bh->oh', post, pre) / max(1, h_prev.size(0))
+                beta = getattr(config, 'HEBB_EMA_BETA', 0.9)
+                self.hebb_score.mul_(beta).add_((1.0 - beta) * hebb_batch)
+
         return h_next
 
 
@@ -412,7 +478,7 @@ class StaticHead(nn.Module):
 
         # 3. 拼接采样结果
         sampled_state = torch.cat((fixed_sample, random_sample), dim=1)
-        
+
         # 4. 将采样状态和注意力上下文拼接起来
         combined_input = torch.cat((sampled_state, attn_context), dim=1)
 
@@ -462,7 +528,7 @@ class HGD_MemNet(nn.Module):
             use_soft_topk_training=getattr(config, 'USE_SOFT_TOPK_TRAINING', True)
         )
 
-    def forward(self, x_t, x_ref, h_prev, temperature=None):
+    def forward(self, x_t, x_ref, h_prev, temperature=None, control=None):
         """
         一次完整的思考步骤
 
@@ -471,6 +537,7 @@ class HGD_MemNet(nn.Module):
             x_ref (torch.Tensor): 参照输入张量, shape: (batch, ref_seq_len)
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch, dynamic_hidden_dim)
             temperature (float, optional): 温度参数，传递给动态组的核心RNN
+            control (torch.Tensor, optional): (batch, C) 控制向量，如 [t_norm, remain_norm, min_done, target_speak_ratio]
 
         Returns:
             h_next (torch.Tensor): 下一步的隐藏状态
@@ -485,14 +552,30 @@ class HGD_MemNet(nn.Module):
         # 2. 编码参照输入 x_ref 来为注意力机制和上下文向量做准备
         # encoder_outputs shape: (batch_size, ref_seq_len, dynamic_hidden_dim)
         encoder_outputs, _ = self.dynamic_group.encoder_rnn(x_ref_embedded)
-        
+
         # 3. 通过动态组进行一步演化
         # 传入编码后的x_ref作为key, 获得下一步的隐藏状态和该步的注意力上下文
         h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev, temperature)
 
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)
-        
+
+        # 5. 可选：使用控制向量对门控进行无参数微调（不破坏可导性）
+        if control is not None:
+            try:
+                alpha = getattr(config, 'CONTROL_GATE_ALPHA', 0.0)
+                if alpha and alpha > 0:
+                    # 简单策略：将 control 压缩到 [0,1]，与 gate_pred 融合
+                    c = torch.sigmoid(torch.nan_to_num(control, nan=0.0))
+                    # 对齐 batch 维；若 control 维度不匹配，取均值作为标量权重
+                    if c.dim() == 2 and c.size(0) == gate_pred.size(0):
+                        c_val = c.mean(dim=1, keepdim=True)
+                    else:
+                        c_val = torch.sigmoid(torch.tensor(0.0, device=gate_pred.device)).expand_as(gate_pred)
+                    gate_pred = (1 - alpha) * gate_pred + alpha * c_val
+            except Exception:
+                pass
+
         return h_next, gate_pred, output_logits
 
 
@@ -508,7 +591,7 @@ if __name__ == '__main__':
     x_t_embed = torch.randn(batch_size, 5, input_dim)  # 更新：测试多步x_t
     x_ref_encoded = torch.randn(batch_size, 10, hidden_dim)
     h_prev = torch.randn(batch_size, hidden_dim)
-    
+
     h_next, attn_context = dynamic_group(x_t_embed, x_ref_encoded, h_prev)
     print(f"输出 h_next 的形状: {h_next.shape}")
     print(f"输出 attn_context 的形状: {attn_context.shape}\n")
@@ -520,7 +603,7 @@ if __name__ == '__main__':
     print("--- 测试 StaticHead (新版采样) ---")
     output_dim = config.VOCAB_SIZE
     static_head_hidden_dim = config.STATIC_HEAD_HIDDEN_DIM
-    
+
     static_head = StaticHead(
         hidden_dim=static_head_hidden_dim,
         sampler_input_dim=hidden_dim,
@@ -549,7 +632,7 @@ if __name__ == '__main__':
     assert gate_signal.shape == (batch_size, 1)
     assert output_logits.shape == (batch_size, output_dim)
     print("\nStaticHead 维度检查通过！\n")
-    
+
     # --- 测试 HGD_MemNet ---
     print("\n--- 测试 HGD_MemNet (完整模型, 新版) ---")
     model = HGD_MemNet(
@@ -558,18 +641,18 @@ if __name__ == '__main__':
         dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
         static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM
     ).to("cpu")
-    
+
     print("\n模型已实例化:")
     # print(model) # 模型结构较大，可以选择不打印
 
     # 准备虚拟输入
-    x_t_test = torch.randint(0, config.VOCAB_SIZE, (batch_size, 5)) 
+    x_t_test = torch.randint(0, config.VOCAB_SIZE, (batch_size, 5))
     x_ref_test = torch.randint(0, config.VOCAB_SIZE, (batch_size, 15))
     h_prev_test = torch.randn(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM)
-    
+
     # 执行前向传播
     h_next_test, gate_pred_test, output_logits_test = model(x_t_test, x_ref_test, h_prev_test)
-    
+
     # 打印输出形状
     print(f"\n模型输出 h_next 的形状: {h_next_test.shape}")
     print(f"模型输出 gate_pred 的形状: {gate_pred_test.shape}")
@@ -579,7 +662,7 @@ if __name__ == '__main__':
     assert h_next_test.shape == (batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM)
     assert gate_pred_test.shape == (batch_size, 1)
     assert output_logits_test.shape == (batch_size, config.VOCAB_SIZE)
-    print("\nHGD_MemNet 维度检查通过！") 
+    print("\nHGD_MemNet 维度检查通过！")
 
     # 新: 测试高级RNN cell
     rnn_cell = ReservoirRNNCell(hidden_dim + hidden_dim, hidden_dim, initial_temperature=1.5, use_hard_sampling=True)  # 更新输入大小

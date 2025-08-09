@@ -4,51 +4,51 @@ import json
 import argparse
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import evaluate
+# import evaluate  # 可选：如需BLEU/ROUGE/BERTScore请安装并解开注释
 
 import config
 from .model import HGD_MemNet
 from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
 from .train import DEVICE # 从训练脚本中导入设备设置
-from functools import partial
+# from functools import partial
 
 import os
-import torch
+# import torch
 from torch.utils.data import DataLoader
 import config
 from .dataset import BinaryDialogueDataset, binary_collate_fn
-from .utils import load_model_from_checkpoint, compute_loss
-import nltk
-from nltk.translate.bleu_score import sentence_bleu
-from math import exp
+# from .utils import load_model_from_checkpoint, compute_loss  # 可选：如需加载检查点或计算损失再启用
+# import nltk
+# from nltk.translate.bleu_score import sentence_bleu
+# from math import exp
 
-nltk.download('punkt')
+# nltk.download('punkt')
 
 # --- JIT 编译优化 ---
 # 同样将贪心解码的核心逻辑进行JIT编译，以提升评估速度
 @torch.jit.script
-def greedy_decode_jitted(model : HGD_MemNet, x_ref_padded, steps_data, vocab_size : int, gate_threshold : float, eos_token : int):
+def greedy_decode_jitted(model : HGD_MemNet, x_ref_padded, steps_data, _vocab_size: int, gate_threshold: float, eos_token: int):
     batch_size = x_ref_padded.size(0)
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=x_ref_padded.device)
 
     # JIT需要显式的类型
     decoded_indices = torch.full((batch_size, config.MAX_CONVO_LENGTH), config.PAD_token, dtype=torch.long, device=x_ref_padded.device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=x_ref_padded.device)
-    
+
     for t in range(len(steps_data)):
         if torch.all(finished):
             break
-            
+
         x_t_padded, _, _ = steps_data[t]
-        
+
         h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev)
-        
+
         # JIT兼容的门控检查
         for i in range(batch_size):
             if not finished[i] and gate_pred[i] > gate_threshold:
                 # 如果门控开启，生成输出
                 topi = torch.argmax(output_logits[i], dim=-1)
-                
+
                 # JIT不支持动态列表追加，我们填充张量
                 # 此处简化为只取第一个token，实际贪心解码需要一个循环
                 # 为了保持评估逻辑一致性，我们暂时不在JIT中做完整解码
@@ -63,46 +63,62 @@ def greedy_decode_jitted(model : HGD_MemNet, x_ref_padded, steps_data, vocab_siz
     return decoded_indices
 
 
-def greedy_decode(model, x_ref_padded, steps_data, vocab):
+def greedy_decode(model, x_ref_padded, steps_data, vocab, min_think: int | None = None, max_think: int | None = None, temperature: float = 0.1):
     """
-    使用贪心策略为一批序列生成回答
-    此版本是包装器，调用JIT版本或原始实现以获得最佳性能
+    使用带有自适应思考步长与门控的简化贪心策略生成回答。
+    - min_think: 最小思考步（None 表示不限制）
+    - max_think: 最大思考步（None 表示由数据 steps 决定）
+    - temperature: 推理温度（传给模型动态组）
     """
     model.eval()
-    
+
     with torch.no_grad():
         # 1. 移动数据到设备
         x_ref_padded = x_ref_padded.to(DEVICE)
         steps_data_device = []
         for x_t, y_t, g_t in steps_data:
+            x_t_dev = x_t.to(DEVICE) if x_t is not None else None
             steps_data_device.append((
-                x_t.to(DEVICE),
+                x_t_dev,
                 y_t.to(DEVICE) if y_t is not None else None,
                 g_t.to(DEVICE)
             ))
 
         # --- 实际解码逻辑 ---
-        # 完整的贪心解码循环在JIT中不易实现，我们保留原始的Python循环逻辑
-        # JIT的优势主要体现在没有复杂控制流的数值计算上
         batch_size = x_ref_padded.size(0)
         h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
-        
+
         decoded_sentences = [""] * batch_size
         finished = [False] * batch_size
-        
-        for t, (x_t_padded, _, _) in enumerate(steps_data_device):
+
+        steps_available = len(steps_data_device)
+        cap = min(steps_available, max_think) if (max_think is not None) else steps_available
+
+        for t in range(cap):
             if all(finished):
                 break
-            
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev)
-            
+            x_t_padded, _, _ = steps_data_device[t]
+
+            # 构造控制向量：t_norm, remain_norm, min_done, budget
+            t_norm = torch.full((batch_size, 1), (t + 1) / max(cap, 1), device=DEVICE)
+            remain_norm = torch.full((batch_size, 1), max(cap - (t + 1), 0) / max(cap, 1), device=DEVICE)
+            min_done_flag = 1.0 if (min_think is None) or ((t + 1) >= min_think) else 0.0
+            min_done = torch.full((batch_size, 1), min_done_flag, device=DEVICE)
+            budget = torch.full((batch_size, 1), float(getattr(config, 'TARGET_SPEAK_RATIO', 0.0) or 0.0), device=DEVICE)
+            control = torch.cat([t_norm, remain_norm, min_done, budget], dim=1)
+
+            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=temperature, control=control)
+
             for i in range(batch_size):
-                if not finished[i] and gate_pred[i].item() > config.GATE_THRESHOLD:
-                    topv, topi = output_logits[i].topk(1)
+                allow_speak = (min_think is None) or ((t + 1) >= min_think)
+                force_speak = (t + 1) >= cap
+                if not finished[i] and (force_speak or (allow_speak and gate_pred[i].item() > config.GATE_THRESHOLD)):
+                    topi = output_logits[i].argmax(dim=-1)
                     idx = topi.item()
                     if idx != config.EOS_token:
-                        word = vocab.index2word.get(str(idx), "<UNK>")
-                        decoded_sentences[i] = word # 简化为单步解码
+                        # 这里的词表映射逻辑简化
+                        word = vocab.index2word.get(idx, "<UNK>") if hasattr(vocab, 'index2word') else str(idx)
+                        decoded_sentences[i] = word
                     finished[i] = True
 
             h_prev = h_next
@@ -113,19 +129,19 @@ def greedy_decode(model, x_ref_padded, steps_data, vocab):
 def evaluate_model(args):
     """主评估函数"""
     print("--- 开始评估 ---")
-    
+
     # 1. 加载词汇表
     print("正在加载词汇表...")
     vocab_path = os.path.join(os.path.dirname(args.data_file), "vocabulary.json")
     if not os.path.exists(vocab_path):
         raise FileNotFoundError(f"在 {vocab_path} 未找到词汇表文件。请确保它与您的数据文件在同一目录中。")
-        
+
     with open(vocab_path, 'r', encoding='utf-8') as f:
         vocab_dict = json.load(f)
     vocab = Vocabulary(vocab_dict['name'])
     vocab.__dict__.update(vocab_dict)
     print(f"词汇表加载完毕。大小: {vocab.num_words}")
-    
+
     config.VOCAB_SIZE = vocab.num_words
 
     # 2. 初始化模型
@@ -168,10 +184,10 @@ def evaluate_model(args):
     # 在评估时也使用多进程加载
     num_workers = min(os.cpu_count(), 4)
     print(f"使用 {num_workers} 个工作进程加载评估数据。")
-    
+
     data_loader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
+        dataset,
+        batch_size=args.batch_size,
         collate_fn=binary_collate_fn,
         num_workers=num_workers,
         pin_memory=True
@@ -180,7 +196,7 @@ def evaluate_model(args):
     # 5. 生成并收集结果
     print("正在生成预测...")
     predictions = []
-    references = []
+    # references = []  # 指标计算暂时关闭
     for x_ref_padded, steps_data in tqdm(data_loader, desc="评估中"):
         # 假设每个剧本的最后一个非空target_text是参考答案
         # 我们需要从 steps_data 中提取参考答案的原始文本
@@ -189,33 +205,23 @@ def evaluate_model(args):
             # 这部分逻辑变得复杂，因为数据是批量处理的
             # 为了简化，我们暂时跳过从二进制数据中提取reference
             pass
-        
+
         # 使用解码函数生成预测
-        preds = greedy_decode(model, x_ref_padded, steps_data, vocab)
+        # 解析 min/max 参数
+        min_t = None if args.min_think is None or args.min_think < 0 else int(args.min_think)
+        max_t = None if args.max_think is None or args.max_think < 0 else int(args.max_think)
+        preds = greedy_decode(model, x_ref_padded, steps_data, vocab, min_think=min_t, max_think=max_t, temperature=0.1)
         predictions.extend(preds)
-    
+
     print("警告：由于数据加载方式的改变，评估指标计算中的'参考答案'部分暂未实现。")
     print(f"已生成 {len(predictions)} 条预测。")
 
     # 6. 计算指标 (暂时跳过，因为references为空)
     # print("\n正在计算评估指标...")
-    
-    # Hugging Face Evaluate
-    bleu_metric = evaluate.load("bleu")
-    rouge_metric = evaluate.load("rouge")
-    
-    # bleu_results = bleu_metric.compute(predictions=predictions, references=[[r] for r in references])
-    # rouge_results = rouge_metric.compute(predictions=predictions, references=[[r] for r in references])
-    
-    # BERTScore
-    print(f"正在使用语言='{args.lang}'计算BERTScore...")
-    bertscore_metric = evaluate.load("bertscore")
-    # bertscore_results = bertscore_metric.compute(predictions=predictions, references=references, lang=args.lang)
 
-    print("\n--- 评估结果 ---")
-    # print(f"BLEU-1: {bleu_results['bleu']:.4f}")
-    # print(f"ROUGE-L: {rouge_results['rougeL']:.4f}")
-    # print(f"BERTScore-F1: {sum(bertscore_results['f1']) / len(bertscore_results['f1']):.4f}")
+    # 如需BLEU/ROUGE/BERTScore，请安装 evaluate/nltk/bertscore 并在上方解开注释后补充计算逻辑。
+    print("\n--- 评估完成（已生成预测；指标计算被跳过） ---")
+    print("提示：安装并启用 evaluate/nltk/bertscore 后可恢复指标计算。")
     print("--------------------------\n")
 
 
@@ -225,10 +231,13 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, required=True, help="包含处理后的测试数据块的目录 (例如, ./data/lccc_processed/test)。")
     parser.add_argument("--batch_size", type=int, default=16, help="用于评估的批处理大小。")
     parser.add_argument("--lang", type=str, default="zh", help="BERTScore模型的语言 (例如, 'en', 'zh')。")
-    
+    parser.add_argument("--min-think", type=int, default=-1, help="最小思考步数（-1 不限制）")
+    parser.add_argument("--max-think", type=int, default=-1, help="最大思考步数（-1 不限制）")
+
+
     args = parser.parse_args()
     if not os.path.isdir(args.data_dir):
         print(f"错误：提供的数据路径 '{args.data_dir}' 不是一个目录。")
         print("请提供包含 chunk_*.pt 文件的有效目录。")
     else:
-        evaluate_model(args) 
+        evaluate_model(args)
