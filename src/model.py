@@ -321,16 +321,7 @@ class ReservoirRNNCell(nn.Module):
             noise = torch.randn_like(topk_vals) * init_std
             self.W_hh_matrix.scatter_(1, topk_idx, noise)
 
-        # 赫布分数累计：只在训练态统计 |h_prev|·|h_next| 的EMA
-        if self.training:
-            with torch.no_grad():
-                pre = h_prev.abs()
-                post = h_next.abs()
-                hebb_batch = torch.einsum('bo,bh->oh', post, pre) / max(1, h_prev.size(0))
-                beta = getattr(config, 'HEBB_EMA_BETA', 0.9)
-                self.hebb_score.mul_(beta).add_((1.0 - beta) * hebb_batch)
 
-        return h_next
 
 
 # --- 动态神经组 (核心演化模块) ---
