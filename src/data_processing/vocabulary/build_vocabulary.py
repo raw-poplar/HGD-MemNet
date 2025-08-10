@@ -20,8 +20,15 @@ import sys
 from collections import Counter
 from tqdm import tqdm
 import argparse
-import jieba
+# jieba 为可选依赖，不强制安装；不可用时会自动回退到简易分词
+try:
+    import jieba  # type: ignore
+    JIEBA_AVAILABLE = True
+except Exception:
+    jieba = None
+    JIEBA_AVAILABLE = False
 import re
+import unicodedata
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
@@ -45,11 +52,14 @@ class VocabularyBuilder:
         self.vocab_size = vocab_size
         self.min_freq = min_freq
         self.word_counter = Counter()
-        
-        # 中文文本预处理正则表达式
+
+        # 文本预处理：模式与过滤器
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
-        self.punctuation_pattern = re.compile(r'[^\w\s]')
-        
+        self.emoji_pattern = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF\U00002190-\U00002BFF]")
+        self.url_pattern = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+        self.email_pattern = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+        self.num_pattern = re.compile(r'\d{5,}')  # 5位以上长数字合并为占位符
+
         print(f"词汇表构建器初始化完成")
         print(f"   数据路径: {self.data_path}")
         print(f"   目标词汇表大小: {self.vocab_size}")
@@ -57,39 +67,53 @@ class VocabularyBuilder:
     
     def preprocess_text(self, text):
         """
-        预处理文本
-        
-        Args:
-            text: 输入文本
-            
-        Returns:
-            处理后的词汇列表
+        预处理文本：
+        - NFKC 归一化与去空白
+        - 去除 URL、邮箱、emoji
+        - 小写化英文
+        - 使用 jieba 分词（不可用时退化为简单切分）
+        - 过滤：仅保留中文词、英文词；数字仅保留<=4位，超过归一化为 <NUM>
         """
         if not text or not isinstance(text, str):
             return []
-        
-        # 清理文本
-        text = text.strip()
+
+        # 基础清理与归一化
+        text = unicodedata.normalize('NFKC', text).strip()
         if not text:
             return []
-        
-        # 使用jieba分词
-        words = jieba.lcut(text)
-        
-        # 过滤和清理词汇
+
+        # 去除 URL/邮箱/emoji
+        text = self.url_pattern.sub(' ', text)
+        text = self.email_pattern.sub(' ', text)
+        text = self.emoji_pattern.sub('', text)
+
+        # 英文小写化
+        text = text.lower()
+
+        # 分词（jieba 不可用时回退）
+        try:
+            words = jieba.lcut(text)
+        except Exception:
+            # 退化：按空白切分 + 保留中文连续块
+            parts = re.split(r"\s+", text)
+            words = []
+            for p in parts:
+                words.extend(re.findall(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+", p))
+
+        # 过滤与清理
         cleaned_words = []
         for word in words:
             word = word.strip()
-            if len(word) == 0:
+            if not word:
                 continue
-            
-            # 保留中文词汇和英文词汇
             if self.chinese_pattern.search(word) or word.isalpha():
                 cleaned_words.append(word)
-            # 保留数字（可选）
-            elif word.isdigit() and len(word) <= 4:
-                cleaned_words.append(word)
-        
+            elif word.isdigit():
+                if len(word) <= 4:
+                    cleaned_words.append(word)
+                else:
+                    cleaned_words.append('<NUM>')
+
         return cleaned_words
     
     def process_jsonl_file(self, file_path):
@@ -105,29 +129,30 @@ class VocabularyBuilder:
         
         print(f"处理文件: {os.path.basename(file_path)}")
         
-        # 计算文件行数
+        # 单遍扫描处理文件内容（避免预先统计总行数的二次 IO）
         with open(file_path, 'r', encoding='utf-8') as f:
-            total_lines = sum(1 for _ in f)
-        
-        # 处理文件内容
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(tqdm(f, total=total_lines, desc=f"处理{os.path.basename(file_path)}")):
+            for line_num, line in enumerate(tqdm(f, desc=f"处理{os.path.basename(file_path)}", unit="lines")):
                 try:
                     dialogue = json.loads(line.strip())
-                    
-                    # 处理对话中的每个句子
+
+                    # 处理对话中的每个句子（兼容 text / input_text / target_text 三种字段）
                     for turn in dialogue:
-                        if isinstance(turn, dict) and 'text' in turn:
-                            text = turn['text']
+                        texts = []
+                        if isinstance(turn, dict):
+                            if 'text' in turn and turn['text']:
+                                texts.append(turn['text'])
+                            if 'input_text' in turn and turn['input_text']:
+                                texts.append(turn['input_text'])
+                            if 'target_text' in turn and turn['target_text']:
+                                texts.append(turn['target_text'])
                         elif isinstance(turn, str):
-                            text = turn
-                        else:
-                            continue
-                        
+                            texts.append(turn)
+
                         # 预处理并统计词频
-                        words = self.preprocess_text(text)
-                        self.word_counter.update(words)
-                
+                        for t in texts:
+                            words = self.preprocess_text(t)
+                            self.word_counter.update(words)
+
                 except json.JSONDecodeError as e:
                     print(f"第{line_num+1}行JSON解析错误: {e}")
                     continue
@@ -161,18 +186,19 @@ class VocabularyBuilder:
         
         print(f"   过滤后词汇数: {len(filtered_words)}")
         
-        # 选择最常用的词汇
-        most_common_words = self.word_counter.most_common(self.vocab_size)
-        
+        # 选择最常用的词汇（基于最小词频过滤后的计数）
+        filtered_counter = Counter(filtered_words)
+        most_common_words = filtered_counter.most_common(self.vocab_size)
+
         print(f"   选择词汇数: {len(most_common_words)}")
-        
+
         # 创建词汇表对象
         vocab = Vocabulary("lccc")
-        
+
         # 添加词汇到词汇表
-        for word, count in tqdm(most_common_words, desc="构建词汇表"):
+        for word, _ in tqdm(most_common_words, desc="构建词汇表"):
             vocab.addWord(word)
-        
+
         print(f"\n词汇表构建完成:")
         print(f"   词汇表大小: {vocab.num_words}")
         print(f"   包含特殊词元: PAD, SOS, EOS, UNK")

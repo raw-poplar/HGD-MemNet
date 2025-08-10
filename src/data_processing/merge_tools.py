@@ -24,12 +24,23 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import config
 
+
+# 统一移除输出中的emoji，避免控制台/日志环境兼容问题
+import re, builtins as _builtins
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF\U00002190-\U00002BFF]")
+_print = _builtins.print
+
+def print(*args, **kwargs):
+    def _strip(s):
+        return _EMOJI_RE.sub('', s) if isinstance(s, str) else s
+    return _print(*[_strip(a) for a in args], **kwargs)
+
 def get_chunk_files(data_type):
     """获取指定数据类型的所有chunk文件"""
     chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
     if not os.path.exists(chunk_dir):
         return []
-    
+
     chunk_files = []
     for file in os.listdir(chunk_dir):
         if file.startswith("chunk_") and file.endswith(".pt"):
@@ -38,34 +49,34 @@ def get_chunk_files(data_type):
                 chunk_files.append((chunk_num, file))
             except:
                 pass
-    
+
     return sorted(chunk_files, key=lambda x: x[0])
 
 def merge_chunks_simple(data_type):
     """简单合并 - 一次性加载所有chunk"""
     print(f"🔄 简单合并 {data_type}...")
-    
+
     chunk_files = get_chunk_files(data_type)
     if not chunk_files:
         print(f"❌ 未找到chunk文件")
         return False
-    
+
     chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
     output_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}.pt")
-    
+
     print(f"📦 找到 {len(chunk_files)} 个chunk文件")
-    
+
     # 检查输出文件
     if os.path.exists(output_file):
         response = input(f"⚠️  {output_file} 已存在，是否覆盖? (y/n): ")
         if response.lower() != 'y':
             return False
-    
+
     # 合并数据
     all_data = []
     total_dialogues = 0
-    
-    for chunk_num, chunk_file in tqdm(chunk_files, desc=f"合并{data_type}"):
+
+    for _, chunk_file in tqdm(chunk_files, desc=f"合并{data_type}"):
         chunk_path = os.path.join(chunk_dir, chunk_file)
         try:
             data = torch.load(chunk_path, weights_only=True)
@@ -74,19 +85,19 @@ def merge_chunks_simple(data_type):
             del data
             gc.collect()
         except Exception as e:
-            print(f"❌ 加载 {chunk_file} 失败: {e}")
+            print(f"加载 {chunk_file} 失败: {e}")
             return False
-    
+
     # 保存结果
     print(f"💾 保存到 {output_file}...")
     torch.save(all_data, output_file)
-    
+
     # 验证
     file_size = os.path.getsize(output_file) / (1024**3)
     print(f"✅ {data_type}.pt 保存成功")
     print(f"📊 总对话数: {total_dialogues:,}")
     print(f"📊 文件大小: {file_size:.2f} GB")
-    
+
     return True
 
 def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
@@ -145,7 +156,7 @@ def merge_chunks_optimized(data_type, max_workers=2, batch_size=10):
                 # 收集结果
                 batch_data = []
                 for future in futures:
-                    chunk_num, data, count = future.result()
+                    _, data, count = future.result()
                     if data is not None:
                         batch_data.extend(data)
                         total_dialogues += count
@@ -286,7 +297,7 @@ def merge_chunks_ultra_optimized_impl(data_type, max_workers, batch_size, save_i
                 batch_data = []
                 for j, future in enumerate(futures):
                     try:
-                        chunk_num, data, count = future.result(timeout=600)  # 10分钟超时
+                        _, data, count = future.result(timeout=600)  # 10分钟超时
                         if data is not None:
                             batch_data.extend(data)
                             total_dialogues += count
@@ -357,112 +368,112 @@ def merge_chunks_ultra_optimized_impl(data_type, max_workers, batch_size, save_i
 def merge_chunks_large_files(data_type, timeout_seconds=300):
     """大文件合并 - 专门处理大chunk文件"""
     print(f"🔄 大文件合并 {data_type}...")
-    
+
     chunk_files = get_chunk_files(data_type)
     if not chunk_files:
         print(f"❌ 未找到chunk文件")
         return False
-    
+
     chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
     output_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{data_type}.pt")
-    
+
     # 显示文件信息
     total_size = 0
-    for chunk_num, chunk_file in chunk_files:
+    for _, chunk_file in chunk_files:
         chunk_path = os.path.join(chunk_dir, chunk_file)
         size = os.path.getsize(chunk_path)
         size_mb = size / (1024*1024)
         total_size += size
-        print(f"   📄 {chunk_file}: {size_mb:.1f} MB")
-    
+        print(f"   {chunk_file}: {size_mb:.1f} MB")
+
     print(f"📊 总大小: {total_size / (1024*1024*1024):.2f} GB")
-    
+
     # 检查输出文件
     if os.path.exists(output_file):
         response = input(f"⚠️  {output_file} 已存在，是否覆盖? (y/n): ")
         if response.lower() != 'y':
             return False
-    
+
     # 逐个处理大文件
     all_data = []
     total_dialogues = 0
-    
-    for i, (chunk_num, chunk_file) in enumerate(chunk_files):
+
+    for i, (_, chunk_file) in enumerate(chunk_files):
         chunk_path = os.path.join(chunk_dir, chunk_file)
         size_mb = os.path.getsize(chunk_path) / (1024*1024)
-        
+
         print(f"\n📦 处理 {chunk_file} ({i+1}/{len(chunk_files)})...")
         print(f"   📊 文件大小: {size_mb:.1f} MB")
-        
+
         start_time = time.time()
-        
+
         try:
             print(f"   🔄 开始加载... (超时: {timeout_seconds}秒)")
             data = torch.load(chunk_path, weights_only=True)
-            
+
             load_time = time.time() - start_time
             dialogue_count = len(data)
-            
+
             print(f"   ✅ 加载成功!")
             print(f"   ⏱️  加载时间: {load_time:.1f}秒")
             print(f"   📊 对话数: {dialogue_count:,}")
-            
+
             # 合并数据
             all_data.extend(data)
             total_dialogues += dialogue_count
-            
+
             print(f"   📊 累计对话数: {total_dialogues:,}")
-            
+
             # 清理内存
             del data
             gc.collect()
-            
+
         except Exception as e:
             load_time = time.time() - start_time
             print(f"   ❌ 加载失败 (用时 {load_time:.1f}秒): {e}")
-            
+
             response = input(f"   是否跳过此文件继续? (y/n): ")
             if response.lower() != 'y':
                 return False
             continue
-    
+
     # 保存结果
     print(f"\n💾 保存合并结果...")
     save_start = time.time()
     torch.save(all_data, output_file)
     save_time = time.time() - save_start
-    
+
     print(f"✅ 保存成功!")
     print(f"⏱️  保存时间: {save_time:.1f}秒")
-    
+
     # 验证
     file_size = os.path.getsize(output_file) / (1024**3)
     print(f"📊 输出文件大小: {file_size:.2f} GB")
     print(f"📊 总对话数: {total_dialogues:,}")
-    
+
     return True
 
 def verify_merged_files():
     """验证合并后的文件"""
     print("🔍 验证合并后的文件...")
-    
+
     datasets = ["train", "valid", "test"]
-    
+
     for dataset in datasets:
         output_file = os.path.join(config.LCCC_PROCESSED_PATH, f"{dataset}.pt")
-        
+
         if os.path.exists(output_file):
             try:
                 print(f"\n📄 验证 {dataset}.pt...")
-                
+
                 # 检查文件大小
                 file_size = os.path.getsize(output_file) / (1024**3)
                 print(f"   📊 文件大小: {file_size:.2f} GB")
-                
+
                 # 加载并检查数据
                 data = torch.load(output_file, weights_only=True)
                 print(f"   📊 对话数量: {len(data):,}")
-                
+
                 # 检查数据结构
                 if data:
                     sample = data[0]
@@ -472,12 +483,12 @@ def verify_merged_files():
                         print(f"   📊 样本: x_ref={x_ref.shape}, steps={len(steps)}")
                     else:
                         print(f"   ⚠️  数据结构异常: {type(sample)}")
-                
+
                 del data
                 gc.collect()
-                
+
                 print(f"   ✅ {dataset}.pt 验证通过")
-                
+
             except Exception as e:
                 print(f"   ❌ {dataset}.pt 验证失败: {e}")
         else:
@@ -488,34 +499,34 @@ def cleanup_chunk_files(data_type, confirm=True):
     chunk_dir = os.path.join(config.LCCC_PROCESSED_PATH, data_type)
     if not os.path.exists(chunk_dir):
         return
-    
+
     chunk_files = [f for f in os.listdir(chunk_dir) if f.startswith("chunk_") and f.endswith(".pt")]
-    
+
     if not chunk_files:
         print(f"📁 {data_type}: 无chunk文件需要清理")
         return
-    
+
     print(f"📁 {data_type}: 找到 {len(chunk_files)} 个chunk文件")
-    
+
     if confirm:
         response = input(f"是否删除 {data_type} 的chunk文件释放空间? (y/n): ")
         if response.lower() != 'y':
             return
-    
+
     # 删除chunk文件
     deleted_size = 0
     for chunk_file in chunk_files:
         chunk_path = os.path.join(chunk_dir, chunk_file)
         deleted_size += os.path.getsize(chunk_path)
         os.remove(chunk_path)
-    
+
     print(f"✅ 已删除 {len(chunk_files)} 个chunk文件")
     print(f"💾 释放空间: {deleted_size / (1024**3):.2f} GB")
 
 def main():
     """主函数 - 合并工具的命令行接口"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="数据合并工具")
     parser.add_argument("--method", choices=["simple", "optimized", "large", "ultra"],
                        default="optimized", help="合并方法")
@@ -526,18 +537,18 @@ def main():
     parser.add_argument("--save-interval", type=int, default=50, help="保存间隔(仅ultra方法)")
     parser.add_argument("--verify", action="store_true", help="验证合并结果")
     parser.add_argument("--cleanup", action="store_true", help="清理chunk文件")
-    
+
     args = parser.parse_args()
-    
+
     print("🔧 数据合并工具")
     print("=" * 40)
-    
+
     # 选择数据集
     if args.dataset == "all":
         datasets = ["valid", "test", "train"]
     else:
         datasets = [args.dataset]
-    
+
     # 选择合并方法
     merge_func = {
         "simple": merge_chunks_simple,
@@ -552,26 +563,26 @@ def main():
         print(f"⚙️  参数: workers={args.workers}, batch_size={args.batch_size}")
         if args.method == "ultra":
             print(f"⚙️  保存间隔: {args.save_interval}")
-    
+
     # 执行合并
     success_count = 0
     for dataset in datasets:
         print(f"\n{'='*20} {dataset.upper()} {'='*20}")
-        
+
         if merge_func(dataset):
             success_count += 1
             print(f"✅ {dataset} 合并成功")
-            
+
             # 清理chunk文件
             if args.cleanup:
                 cleanup_chunk_files(dataset, confirm=False)
         else:
             print(f"❌ {dataset} 合并失败")
-    
+
     # 验证结果
     if args.verify:
         verify_merged_files()
-    
+
     print(f"\n🎯 合并完成: {success_count}/{len(datasets)} 个数据集")
 
 if __name__ == "__main__":

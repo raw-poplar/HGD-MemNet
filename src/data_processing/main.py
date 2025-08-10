@@ -13,6 +13,17 @@ import argparse
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+
+# 统一移除输出中的emoji，避免控制台/日志环境兼容问题
+import re, builtins as _builtins
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF\U00002190-\U00002BFF]")
+_print = _builtins.print
+
+def print(*args, **kwargs):
+    def _strip(s):
+        return _EMOJI_RE.sub('', s) if isinstance(s, str) else s
+    return _print(*[_strip(a) for a in args], **kwargs)
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
@@ -22,21 +33,21 @@ def main():
 使用示例:
   # 完整的数据处理流程
   python -m src.data_processing.main --full-pipeline --workers=4
-  
+
   # 只进行数据转换
   python -m src.data_processing.main --convert --workers=4
-  
+
   # 只进行数据合并
   python -m src.data_processing.main --merge --method=optimized
-  
+
   # 检查数据状态
   python -m src.data_processing.main --check
-  
+
   # 调试和测试
   python -m src.data_processing.main --debug
         """
     )
-    
+
     # 主要操作
     parser.add_argument("--full-pipeline", action="store_true",
                        help="执行完整的数据处理流程")
@@ -50,17 +61,17 @@ def main():
                        help="运行调试和测试工具")
     parser.add_argument("--cleanup", action="store_true",
                        help="清理临时文件")
-    
+
     # 转换参数
     parser.add_argument("--workers", type=int, default=2,
                        help="工作进程数 (默认: 2)")
-    
+
     # 合并参数
     parser.add_argument("--merge-method", choices=["simple", "optimized", "large"],
                        default="optimized", help="合并方法 (默认: optimized)")
     parser.add_argument("--dataset", choices=["train", "valid", "test", "all"],
                        default="all", help="要处理的数据集 (默认: all)")
-    
+
     # 其他选项
     parser.add_argument("--verify", action="store_true",
                        help="验证处理结果")
@@ -68,38 +79,38 @@ def main():
                        help="强制覆盖现有文件")
     parser.add_argument("--verbose", action="store_true",
                        help="显示详细输出")
-    
+
     args = parser.parse_args()
-    
+
     # 如果没有指定任何操作，显示帮助
     if not any([args.full_pipeline, args.convert, args.merge, args.check, args.debug, args.cleanup]):
         parser.print_help()
         return
-    
+
     print("🚀 HGD-MemNet 数据处理工具")
     print("=" * 50)
-    
+
     try:
         if args.full_pipeline:
             run_full_pipeline(args)
         else:
             if args.convert:
                 run_convert(args)
-            
+
             if args.merge:
                 run_merge(args)
-            
+
             if args.check:
                 run_check(args)
-            
+
             if args.debug:
                 run_debug(args)
-            
+
             if args.cleanup:
                 run_cleanup(args)
-        
+
         print("\n✅ 所有操作完成!")
-        
+
     except KeyboardInterrupt:
         print("\n⏸️  用户中断操作")
     except Exception as e:
@@ -111,24 +122,24 @@ def main():
 def run_full_pipeline(args):
     """运行完整的数据处理流程"""
     print("🔄 执行完整数据处理流程...")
-    
+
     # 1. 检查当前状态
     print("\n📊 步骤1: 检查当前状态")
     run_check(args)
-    
+
     # 2. 数据转换
     print("\n🔄 步骤2: 数据转换")
     run_convert(args)
-    
+
     # 3. 数据合并
     print("\n📦 步骤3: 数据合并")
     run_merge(args)
-    
+
     # 4. 验证结果
     if args.verify:
         print("\n🔍 步骤4: 验证结果")
         run_verify(args)
-    
+
     # 5. 清理临时文件
     if args.cleanup:
         print("\n🧹 步骤5: 清理临时文件")
@@ -137,13 +148,13 @@ def run_full_pipeline(args):
 def run_convert(args):
     """运行数据转换"""
     print(f"🔄 数据转换 (workers={args.workers})...")
-    
+
     from .prepare_binary_data import main as convert_main
-    
+
     # 临时修改sys.argv来传递参数
     original_argv = sys.argv.copy()
     sys.argv = ["prepare_binary_data.py", f"--num_workers={args.workers}"]
-    
+
     try:
         convert_main()
     finally:
@@ -152,9 +163,9 @@ def run_convert(args):
 def run_merge(args):
     """运行数据合并"""
     print(f"📦 数据合并 (method={args.merge_method}, dataset={args.dataset})...")
-    
+
     from .merge_tools import main as merge_main
-    
+
     # 临时修改sys.argv来传递参数
     original_argv = sys.argv.copy()
     merge_args = [
@@ -163,14 +174,14 @@ def run_merge(args):
         f"--dataset={args.dataset}",
         f"--workers={args.workers}"
     ]
-    
+
     if args.verify:
         merge_args.append("--verify")
     if args.cleanup:
         merge_args.append("--cleanup")
-    
+
     sys.argv = merge_args
-    
+
     try:
         merge_main()
     finally:
@@ -179,18 +190,18 @@ def run_merge(args):
 def run_check(args):
     """运行数据检查"""
     print("🔍 数据状态检查...")
-    
+
     from .data_utils import main as utils_main
-    
+
     # 临时修改sys.argv来传递参数
     original_argv = sys.argv.copy()
     check_args = ["data_utils.py", "--check", "--estimate", "--space"]
-    
+
     if args.dataset != "all":
         check_args.extend(["--dataset", args.dataset])
-    
+
     sys.argv = check_args
-    
+
     try:
         utils_main()
     finally:
@@ -199,18 +210,18 @@ def run_check(args):
 def run_debug(args):
     """运行调试工具"""
     print("🔧 调试工具...")
-    
+
     from .debug_tools import main as debug_main
-    
+
     # 临时修改sys.argv来传递参数
     original_argv = sys.argv.copy()
     debug_args = ["debug_tools.py"]
-    
+
     if args.dataset != "all":
         debug_args.extend(["--dataset", args.dataset])
-    
+
     sys.argv = debug_args
-    
+
     try:
         debug_main()
     finally:
@@ -219,13 +230,13 @@ def run_debug(args):
 def run_cleanup(args):
     """运行清理操作"""
     print("🧹 清理临时文件...")
-    
+
     from .data_utils import cleanup_partial_files
-    
+
     # 清理partial文件
     dataset = None if args.dataset == "all" else args.dataset
     cleaned_count = cleanup_partial_files(dataset, confirm=not args.force)
-    
+
     if cleaned_count > 0:
         print(f"✅ 清理了 {cleaned_count} 个文件")
     else:
@@ -234,14 +245,14 @@ def run_cleanup(args):
 def run_verify(args):
     """运行验证操作"""
     print("🔍 验证处理结果...")
-    
+
     from .merge_tools import verify_merged_files
     verify_merged_files()
 
 def show_status():
     """显示当前处理状态"""
     print("📊 当前处理状态:")
-    
+
     try:
         from .debug_tools import analyze_processing_status
         analyze_processing_status()
@@ -252,7 +263,7 @@ def interactive_mode():
     """交互模式"""
     print("🎮 交互模式")
     print("=" * 30)
-    
+
     while True:
         print("\n可用操作:")
         print("1. 检查数据状态")
@@ -262,10 +273,10 @@ def interactive_mode():
         print("5. 清理文件")
         print("6. 完整流程")
         print("0. 退出")
-        
+
         try:
             choice = input("\n请选择操作 (0-6): ").strip()
-            
+
             if choice == "0":
                 break
             elif choice == "1":
@@ -308,7 +319,7 @@ def interactive_mode():
                 run_full_pipeline(args)
             else:
                 print("❌ 无效选择")
-                
+
         except KeyboardInterrupt:
             print("\n⏸️  操作中断")
         except Exception as e:

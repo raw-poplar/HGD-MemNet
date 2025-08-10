@@ -2,6 +2,47 @@
 
 import os
 
+# ==============================================================================
+# 配置文件使用说明（建议先读）
+# ------------------------------------------------------------------------------
+# 1) 本文件集中定义了模型结构、训练流程、数据路径与日志等配置。
+#    - 可直接修改常量；或在训练/脚本中通过 `config.XXX = ...` 动态覆盖。
+#    - 少数参数也支持环境变量覆盖（如 DATASET_PATH）。
+#
+# 2) 常见“如何选”简表：
+#    - 内存吃紧：降低 EMBEDDING_DIM / DYNAMIC_GROUP_HIDDEN_DIM；减少 NUM_ATTENTION_HEADS；
+#                 降低 BATCH_SIZE、提高 GRADIENT_ACCUMULATION_STEPS；关闭 USE_CONTEXTUAL_SAMPLER。
+#    - 想要更强表达：适当增大 EMBEDDING_DIM/HIDDEN_DIM；开启多头注意力(>=2)；开启 USE_CONTEXTUAL_SAMPLER。
+#    - 训练不稳定：
+#        • 降低 LEARNING_RATE；
+#        • 提高 GATE_THRESHOLD（更保守的发声）；
+#        • 降低 INITIAL_TEMPERATURE 或提高 MIN_TEMPERATURE（减少采样噪声）；
+#        • 关闭 USE_SOFT_TOPK_TRAINING（改为硬采样）以降低梯度噪声（可能影响收敛速度）。
+#
+# 3) 重要耦合关系：
+#    - 多头注意力：DYNAMIC_GROUP_HIDDEN_DIM % NUM_ATTENTION_HEADS == 0 必须为真。
+#    - 批大小与累积步：等效批次 ≈ BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS。
+#    - 退火温度：训练循环按步内 t 使用 current_temperature = max(INITIAL_TEMPERATURE * TEMPERATURE_DECAY**t, MIN_TEMPERATURE)。
+#    - 门控与步数：USE_GATED_MULTISTEP 与 MIN/MAX_THINKING_STEPS 一起决定何时“说话”。
+#
+# 4) 数据与mask：
+#    - PAD_token 会用于构建注意力 padding mask，确保注意力不“看见”填充位。
+#    - collate 函数会用 PAD_token 进行 pad，模型内部自动使用该 mask。
+#
+# 5) 剪枝/再生长（动态稀疏）：
+#    - PRUNE_ENABLE / REGROW_ENABLE 控制是否周期性对核心RNN的连接进行稀疏化与再生长；
+#    - 剪枝/再生长的统计（hebb/usage）在训练态通过 EMA 积累，暖身后再触发更稳健。
+#
+# 6) 路径与数据准备：
+#    - DATASET_PATH 可通过环境变量覆盖（建议使用绝对路径或外接磁盘路径）；
+#    - 预处理脚本会生成分块化的二进制数据（chunk_*.pt），训练脚本按需加载，降低内存占用。
+#
+# 7) 建议流程：
+#    - 先运行数据预处理：python -m src.data_processing.prepare_binary_data --num_workers=4
+#    - 再训练：python -m src.train
+# ==============================================================================
+
+
 # ------------------------------------
 # 模型维度和结构相关的超参数
 # ------------------------------------
@@ -37,13 +78,6 @@ CONTEXT_VECTOR_DIM = 128
 #   - 二者之和不应超过 1.0；实际采样数会取整。
 FIXED_SAMPLING_RATIO = 0.3
 RANDOM_SAMPLING_RATIO = 0.05
-
-# --- 注意力机制配置 ---
-# 关于注意力头数量（NUM_ATTENTION_HEADS）：
-#   - 0: 无注意力（使用历史编码的平均池化作为上下文），速度最快、最省显存；
-#   - 1: 单头 Bahdanau 注意力；
-#   - >=2: 多头注意力（Transformer 风格），注意 DYNAMIC_GROUP_HIDDEN_DIM % NUM_ATTENTION_HEADS == 0。
-# 补充：ATTENTION_HEADS 变量已弃用，仅使用 NUM_ATTENTION_HEADS。
 
 
 
@@ -114,6 +148,10 @@ MIN_TEMPERATURE = 0.1
 # 注意力机制相关参数
 # ------------------------------------
 # NUM_ATTENTION_HEADS: 注意力头数量（0/1/多）。
+# 关于注意力头数量（NUM_ATTENTION_HEADS）：
+#   - 0: 无注意力（使用历史编码的平均池化作为上下文），速度最快、最省显存；
+#   - 1: 单头 Bahdanau 注意力；
+#   - >=2: 多头注意力（Transformer 风格），注意 DYNAMIC_GROUP_HIDDEN_DIM % NUM_ATTENTION_HEADS == 0。
 # ATTENTION_DROPOUT: 注意力权重上的 dropout（防过拟合）；
 # ATTENTION_HEAD_DIM: 单头维度；默认为 None，表示使用 hidden_dim // num_heads；
 # USE_ATTENTION_BIAS: 注意力线性映射是否带偏置；
@@ -169,6 +207,8 @@ GATE_THRESHOLD = 0.8
 
 # USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
 USE_SOFT_TOPK_TRAINING = True
+# 是否使用基于上下文的随机采样评分器（增强版采样器）
+USE_CONTEXTUAL_SAMPLER = True
 
 
 # 门控正则与思考损失（可选）
