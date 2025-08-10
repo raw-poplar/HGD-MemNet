@@ -175,6 +175,9 @@ ATTENTION_TYPE = "bahdanau"
 # ------------------------------------
 # 是否启用按 chunk 流式训练；开启后训练会逐块加载数据，并在训练当前块时后台预取下一块
 USE_STREAMING_TRAIN = True
+# 流式验证与测试
+USE_STREAMING_VALIDATE = True
+USE_STREAMING_TEST = True
 # 预取下一块开关
 STREAM_PREFETCH = True
 # 预取使用的后台线程数（目前实现仅使用1，保留配置作为未来扩展）
@@ -208,7 +211,10 @@ CSV_LOG_PATH = "./logs/train_metrics.csv"
 # 验证与模型保存
 # ------------------------------------
 # VALIDATE_EVERY_N_STEPS: 每 N 个“内部步”后在验证集上评估一次（频繁会减慢训练）。
-VALIDATE_EVERY_N_STEPS = 200
+VALIDATE_EVERY_N_STEPS = 2000
+# 可选：验证时仅抽样固定数量的对话（0 表示禁用抽样，使用全量）。
+VALIDATE_SAMPLE_SIZE = 1000           # 示例：设为 1000 可大幅缩短验证时间
+VALIDATE_SHUFFLE_WHEN_SUBSAMPLE = True  # 抽样时是否打乱验证集顺序
 
 # BEST_MODEL_DIR: 保存验证集最优模型权重的目录。
 BEST_MODEL_DIR = "./best_model"
@@ -271,7 +277,7 @@ USE_GATED_MULTISTEP = False
 CHECKPOINT_DIR = "./checkpoints"
 
 # SAVE_CHECKPOINT_EVERY_N_BATCHES: 每处理多少个 batch（内部步聚合后的单位）保存一次检查点。
-SAVE_CHECKPOINT_EVERY_N_BATCHES = 300
+SAVE_CHECKPOINT_EVERY_N_BATCHES = 1000
 
 # MAX_CHECKPOINTS_TO_KEEP: 最多保留的检查点个数（滚动删除旧的）。
 MAX_CHECKPOINTS_TO_KEEP = 5

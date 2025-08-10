@@ -7,6 +7,7 @@ import os
 import glob
 from tqdm import tqdm
 from torch.amp import GradScaler
+import time
 
 # 新增：性能优化
 import torch.backends.cudnn as cudnn
@@ -232,64 +233,232 @@ def stream_chunks(directory: str, prefetch: bool = True):  # prefetch workers从
 
 
 def validate_model(model):
-    """验证模型，只计算损失。"""
+    """验证模型：支持流式按 chunk 验证以降低内存占用。"""
     model.eval()
     val_data_path = os.path.join(config.LCCC_PROCESSED_PATH, "valid")
     if not os.path.exists(val_data_path):
         print("警告：找不到二进制验证数据目录 valid/，跳过验证。")
         return float('inf')
 
-    try:
-        val_dataset = BinaryDialogueDataset(val_data_path)
-    except FileNotFoundError as e:
-        print(f"警告：初始化验证数据集失败: {e}")
-        return float('inf')
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        collate_fn=binary_collate_fn,
-        num_workers=min(os.cpu_count(), 2),  # 同样限制为2
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-        prefetch_factor=2,
-        shuffle=False,
-    )
-
-    total_val_loss = 0
+    total_val_loss = 0.0
     total_steps = 0
+
+    # 抽样大小配置
+    sample_size = int(getattr(config, 'VALIDATE_SAMPLE_SIZE', 0) or 0)
+    shuffle_when_subsample = bool(getattr(config, 'VALIDATE_SHUFFLE_WHEN_SUBSAMPLE', True))
+
     with torch.no_grad():
         # 验证阶段使用硬采样
         model.dynamic_group.core_rnn.use_hard_sampling = True
-        pbar = tqdm(val_loader, desc="正在验证")
-        for x_ref_padded, steps_data in pbar:
-            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
-            h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-            for x_t, y_t, g_t in steps_data:
-                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
-                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
-                g_t = g_t.to(DEVICE, non_blocking=True)
+        if getattr(config, 'USE_STREAMING_VALIDATE', True):
+            # 按训练同样方式流式加载验证集
+            try:
+                seen_samples = 0
+                for chunk_name, chunk_data in stream_chunks(val_data_path, prefetch=getattr(config, 'STREAM_PREFETCH', True)):
+                    try:
+                        # 若启用抽样，则在 chunk 级别进行截断抽样
+                        if sample_size > 0:
+                            if shuffle_when_subsample:
+                                import random as _rnd
+                                _rnd.shuffle(chunk_data)
+                            remaining = max(0, sample_size - seen_samples)
+                            if remaining <= 0:
+                                break
+                            chunk_data = chunk_data[:remaining]
 
-                # 新增：在验证时使用低温
-                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)  # 低温（验证不传 control）
+                        val_dataset = _ChunkListDataset(chunk_data)
+                        val_loader = DataLoader(
+                            val_dataset,
+                            batch_size=config.BATCH_SIZE,
+                            collate_fn=binary_collate_fn,
+                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            shuffle=False,
+                        )
+                        pbar = tqdm(val_loader, desc=f"正在验证 | {chunk_name}")
+                        for x_ref_padded, steps_data in pbar:
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                            h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-                # 使用 utils 中的 compute_loss（验证阶段不加思考对比项，避免方差）
-                step_loss = compute_loss(
-                    gate_pred, g_t, output_logits, y_t,
-                    gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
-                    target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
-                )
+                            for x_t, y_t, g_t in steps_data:
+                                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
+                                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
+                                g_t = g_t.to(DEVICE, non_blocking=True)
 
-                total_val_loss += step_loss.item()
-                h_prev = h_next
-                total_steps += 1
+                                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+
+                                step_loss = compute_loss(
+                                    gate_pred, g_t, output_logits, y_t,
+                                    gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                                    target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                                )
+
+                                total_val_loss += step_loss.item()
+                                h_prev = h_next
+                                total_steps += 1
+                        seen_samples += len(val_dataset)
+                    finally:
+                        # 显式释放当前 chunk 引用（stream_chunks 内也会释放其内部数据）
+                        del chunk_data
+                        gc.collect()
+                    if sample_size > 0 and seen_samples >= sample_size:
+                        break
+            except FileNotFoundError as e:
+                print(f"警告：验证数据块加载失败: {e}")
+                return float('inf')
+        else:
+            # 回退到整目录 DataLoader（非流式）
+            try:
+                val_dataset = BinaryDialogueDataset(val_data_path)
+            except FileNotFoundError as e:
+                print(f"警告：初始化验证数据集失败: {e}")
+                return float('inf')
+
+            # 若启用抽样：先取前 sample_size 条（可选打乱），再构造 DataLoader
+            if sample_size > 0:
+                indices = list(range(len(val_dataset)))
+                if shuffle_when_subsample:
+                    import random as _rnd
+                    _rnd.shuffle(indices)
+                indices = indices[:sample_size]
+                subset = [val_dataset[i] for i in indices]
+                val_dataset = _ChunkListDataset(subset)
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.BATCH_SIZE,
+                collate_fn=binary_collate_fn,
+                num_workers=min(os.cpu_count(), 2),
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=True,
+                prefetch_factor=2,
+                shuffle=False,
+            )
+            pbar = tqdm(val_loader, desc="正在验证")
+            for x_ref_padded, steps_data in pbar:
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+
+                for x_t, y_t, g_t in steps_data:
+                    x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
+                    g_t = g_t.to(DEVICE, non_blocking=True)
+
+                    h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+
+                    step_loss = compute_loss(
+                        gate_pred, g_t, output_logits, y_t,
+                        gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                        target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                    )
+
+                    total_val_loss += step_loss.item()
+                    h_prev = h_next
+                    total_steps += 1
 
     # 恢复软采样
     model.dynamic_group.core_rnn.use_hard_sampling = False
     avg_val_loss = total_val_loss / total_steps if total_steps > 0 else 0
     model.train()
     return avg_val_loss
+
+
+def test_model(model):
+    """测试集评估：支持流式按 chunk 测试，只计算损失（与验证一致）。"""
+    model.eval()
+    test_data_path = os.path.join(config.LCCC_PROCESSED_PATH, "test")
+    if not os.path.exists(test_data_path):
+        print("警告：找不到二进制测试数据目录 test/，跳过测试。")
+        return float('inf')
+
+    total_test_loss = 0.0
+    total_steps = 0
+
+    with torch.no_grad():
+        model.dynamic_group.core_rnn.use_hard_sampling = True
+
+        if getattr(config, 'USE_STREAMING_TEST', True):
+            try:
+                for chunk_name, chunk_data in stream_chunks(test_data_path, prefetch=getattr(config, 'STREAM_PREFETCH', True)):
+                    try:
+                        test_dataset = _ChunkListDataset(chunk_data)
+                        test_loader = DataLoader(
+                            test_dataset,
+                            batch_size=config.BATCH_SIZE,
+                            collate_fn=binary_collate_fn,
+                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            shuffle=False,
+                        )
+                        pbar = tqdm(test_loader, desc=f"正在测试 | {chunk_name}")
+                        for x_ref_padded, steps_data in pbar:
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                            h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+
+                            for x_t, y_t, g_t in steps_data:
+                                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
+                                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
+                                g_t = g_t.to(DEVICE, non_blocking=True)
+
+                                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+
+                                step_loss = compute_loss(
+                                    gate_pred, g_t, output_logits, y_t,
+                                    gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                                    target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                                )
+
+                                total_test_loss += step_loss.item()
+                                h_prev = h_next
+                                total_steps += 1
+                    finally:
+                        del chunk_data
+                        gc.collect()
+            except FileNotFoundError as e:
+                print(f"警告：测试数据块加载失败: {e}")
+                return float('inf')
+        else:
+            try:
+                test_dataset = BinaryDialogueDataset(test_data_path)
+            except FileNotFoundError as e:
+                print(f"警告：初始化测试数据集失败: {e}")
+                return float('inf')
+
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=config.BATCH_SIZE,
+                collate_fn=binary_collate_fn,
+                num_workers=min(os.cpu_count(), 2),
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=True,
+                prefetch_factor=2,
+                shuffle=False,
+            )
+            pbar = tqdm(test_loader, desc="正在测试")
+            for x_ref_padded, steps_data in pbar:
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+
+                for x_t, y_t, g_t in steps_data:
+                    x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
+                    g_t = g_t.to(DEVICE, non_blocking=True)
+
+                    h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+
+                    step_loss = compute_loss(
+                        gate_pred, g_t, output_logits, y_t,
+                        gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                        target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                    )
+
+                    total_test_loss += step_loss.item()
+                    h_prev = h_next
+                    total_steps += 1
+
+    model.dynamic_group.core_rnn.use_hard_sampling = False
+    avg_test_loss = total_test_loss / total_steps if total_steps > 0 else 0
+    model.train()
+    return avg_test_loss
 
 def save_checkpoint(model, optimizer, scaler, epoch, steps, directory, is_best=False):
     if not os.path.exists(directory): os.makedirs(directory)
@@ -521,7 +690,13 @@ def train_model():
                             save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
 
             scheduler.step()  # 每轮更新学习率
-            print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
+            # 轮次汇总日志
+            try:
+                print(f"\n[汇总] 轮次 {epoch+1}/{config.NUM_EPOCHS} 完成 | 最佳验证损失: {best_val_loss:.4f} | 总更新步: {total_steps} | 当前学习率: {optimizer.param_groups[0]['lr']:.6f}")
+                logging.info(f"epoch={epoch+1} total_steps={total_steps} best_val_loss={best_val_loss:.6f} lr={optimizer.param_groups[0]['lr']:.6f}")
+            except Exception:
+                pass
+
             # 资源回收（每轮结束）
             try:
                 if torch.cuda.is_available():
