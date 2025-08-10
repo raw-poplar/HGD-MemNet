@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import json
 import os
 import glob
@@ -14,9 +14,15 @@ cudnn.benchmark = True  # 启用 cudnn 基准测试以加速
 
 import config
 from .model import HGD_MemNet
-from .dataset import Vocabulary, BinaryDialogueDataset, binary_collate_fn
+from .dataset import (
+    Vocabulary,
+    BinaryDialogueDataset,
+    binary_collate_fn,
+)
 from .utils import compute_loss, set_seed  # 新增：导入工具函数与随机种子
 import logging  # 新增：日志记录
+import gc
+from concurrent.futures import ThreadPoolExecutor
 
 # 设置日志
 logging.basicConfig(filename='train.log', level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -97,9 +103,10 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
 
             h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature, control=control)
 
-            # 统计门控均值/熵
-            gate_mean_acc += float(gate_pred.mean().item())
-            p = torch.clamp(gate_pred, 1e-6, 1 - 1e-6)
+            # 统计门控均值/熵（gate_pred 为 logits，这里按概率统计）
+            gate_prob = torch.sigmoid(gate_pred)
+            gate_mean_acc += float(gate_prob.mean().item())
+            p = torch.clamp(gate_prob, 1e-6, 1 - 1e-6)
             gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
             gate_obs += 1
 
@@ -180,6 +187,48 @@ def maybe_prune_regrow(model, total_steps):
         logging.info(f"[sparsify] step={total_steps} nnz: {before_nz}->{after_nz}")
     except Exception as e:
         logging.warning(f"剪枝/再生长触发失败: {e}")
+
+# ========= Chunk 流式加载工具 =========
+from typing import List
+
+def _sorted_chunk_paths(directory: str) -> List[str]:
+    paths = glob.glob(os.path.join(directory, 'chunk_*.pt'))
+    paths = sorted(paths, key=lambda p: int(os.path.basename(p).split('_')[1].split('.')[0]))
+    return paths
+
+class _ChunkListDataset(Dataset):
+    """将内存中的 chunk 列表封装为 Dataset 以配合 DataLoader 使用"""
+    def __init__(self, data_list):
+        self.data_list = data_list
+    def __len__(self):
+        return len(self.data_list)
+    def __getitem__(self, idx):
+        return self.data_list[idx]
+
+def _load_chunk(path: str):
+    return torch.load(path, weights_only=True)
+
+def stream_chunks(directory: str, prefetch: bool = True):  # prefetch workers从config读取
+    """逐块流式加载，当前块训练时预取下一块"""
+    paths = _sorted_chunk_paths(directory)
+    if not paths:
+        raise FileNotFoundError(f"在 '{directory}' 中未找到数据块文件 (chunk_*.pt)。")
+    future = None
+    executor = ThreadPoolExecutor(max_workers=getattr(config, 'STREAM_PREFETCH_WORKERS', 1)) if prefetch else None
+    for i, path in enumerate(paths):
+        if executor:
+            if future is None:
+                future = executor.submit(_load_chunk, path)
+            data = future.result()
+            future = executor.submit(_load_chunk, paths[i+1]) if i+1 < len(paths) else None
+        else:
+            data = _load_chunk(path)
+        yield os.path.basename(path), data
+        del data
+        gc.collect()
+    if executor:
+        executor.shutdown(wait=True)
+
 
 
 def validate_model(model):
@@ -375,62 +424,113 @@ def train_model():
                 csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean'])
 
         for epoch in range(start_epoch, config.NUM_EPOCHS):
-            train_dataset = BinaryDialogueDataset(train_data_dir)
-            # 注意：不再需要除以梯度累积步数
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=config.BATCH_SIZE,
-                collate_fn=binary_collate_fn,
-                num_workers=min(os.cpu_count(), 2),  # 限制为2以降低内存使用
-                pin_memory=torch.cuda.is_available(),
-                persistent_workers=True,
-                prefetch_factor=2,
-                shuffle=True,
-            )
-
-            pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
-
-            for x_ref_padded, steps_data in pbar:
-                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler)
-
-                total_steps += steps_in_batch
-                avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
-                pbar.set_postfix({
-                    "平均步损失": f"{avg_loss:.4f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
-                    "总更新步数": total_steps,
-                    "门控均值": f"{gate_mean:.3f}",
-                    "cap触发": cap_hit,
-                })
-
-                # 记录指标
-                if writer is not None:
-                    writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
-                    writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
-                    writer.add_scalar('train/gate_mean', gate_mean, total_steps)
-                    writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
-                    writer.add_scalar('train/cap_hit', cap_hit, total_steps)
-                if csv_writer is not None:
-                    csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
-
-                # 动态稀疏：周期性触发剪枝/再生长
-                maybe_prune_regrow(model, total_steps)
-
-                if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
-                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
-
-                if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
-                    val_loss = validate_model(model)
-                    print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        print("发现新的最佳模型！正在保存...")
-                        logging.info(f"新最佳验证损失: {val_loss}")
-                        save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
+            if getattr(config, 'USE_STREAMING_TRAIN', True):
+                # ========= 流式训练：逐块加载与训练 =========
+                print("启用流式训练：按 chunk 逐块加载与训练（后台预取）")
+                for chunk_name, chunk_data in stream_chunks(train_data_dir, prefetch=getattr(config, 'STREAM_PREFETCH', True)):
+                    try:
+                        train_dataset = _ChunkListDataset(chunk_data)
+                        train_loader = DataLoader(
+                            train_dataset,
+                            batch_size=config.BATCH_SIZE,
+                            collate_fn=binary_collate_fn,
+                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            shuffle=True,
+                        )
+                        pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
+                        for x_ref_padded, steps_data in pbar:
+                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(
+                                x_ref_padded, steps_data, model, optimizer, scaler
+                            )
+                            total_steps += steps_in_batch
+                            avg_loss = batch_loss / max(1, steps_in_batch)
+                            pbar.set_postfix({
+                                "平均步损失": f"{avg_loss:.4f}",
+                                "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                                "总更新步数": total_steps,
+                                "门控均值": f"{gate_mean:.3f}",
+                                "cap触发": cap_hit,
+                            })
+                            if writer is not None:
+                                writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
+                                writer.add_scalar('train/gate_mean', gate_mean, total_steps)
+                                writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
+                                writer.add_scalar('train/cap_hit', cap_hit, total_steps)
+                            if csv_writer is not None:
+                                csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
+                            maybe_prune_regrow(model, total_steps)
+                            if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+                                save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                            if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
+                                val_loss = validate_model(model)
+                                print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                                if val_loss < best_val_loss:
+                                    best_val_loss = val_loss
+                                    print("发现新的最佳模型！正在保存...")
+                                    logging.info(f"新最佳验证损失: {val_loss}")
+                                    save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
+                    finally:
+                        del chunk_data
+                        gc.collect()
+            else:
+                # ========= 传统整目录 DataLoader =========
+                train_dataset = BinaryDialogueDataset(train_data_dir)
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=config.BATCH_SIZE,
+                    collate_fn=binary_collate_fn,
+                    num_workers=min(os.cpu_count(), 2),
+                    pin_memory=torch.cuda.is_available(),
+                    persistent_workers=True,
+                    prefetch_factor=2,
+                    shuffle=True,
+                )
+                pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
+                for x_ref_padded, steps_data in pbar:
+                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(
+                        x_ref_padded, steps_data, model, optimizer, scaler
+                    )
+                    total_steps += steps_in_batch
+                    avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
+                    pbar.set_postfix({
+                        "平均步损失": f"{avg_loss:.4f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                        "总更新步数": total_steps,
+                        "门控均值": f"{gate_mean:.3f}",
+                        "cap触发": cap_hit,
+                    })
+                    if writer is not None:
+                        writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                        writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
+                        writer.add_scalar('train/gate_mean', gate_mean, total_steps)
+                        writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
+                        writer.add_scalar('train/cap_hit', cap_hit, total_steps)
+                    if csv_writer is not None:
+                        csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
+                    maybe_prune_regrow(model, total_steps)
+                    if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+                        save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                    if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
+                        val_loss = validate_model(model)
+                        print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            print("发现新的最佳模型！正在保存...")
+                            logging.info(f"新最佳验证损失: {val_loss}")
+                            save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
 
             scheduler.step()  # 每轮更新学习率
-
             print(f"\n轮次 {epoch+1}/{config.NUM_EPOCHS} 完成.\n")
+            # 资源回收（每轮结束）
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+
         print("\n训练全部完成！")
         logging.info("训练完成")
         # 关闭记录器

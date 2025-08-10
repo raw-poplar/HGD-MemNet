@@ -157,7 +157,7 @@ MIN_TEMPERATURE = 0.1
 # USE_ATTENTION_BIAS: 注意力线性映射是否带偏置；
 # ATTENTION_TEMPERATURE: 注意力温度（softmax 锐度控制）。
 # ATTENTION_TYPE: 注意力类型（"bahdanau"/"dot_product"/"multi_head"）。
-NUM_ATTENTION_HEADS = 1
+NUM_ATTENTION_HEADS = 0
 ATTENTION_DROPOUT = 0.1
 ATTENTION_HEAD_DIM = None
 USE_ATTENTION_BIAS = True
@@ -168,6 +168,25 @@ ATTENTION_TEMPERATURE = 1.0
 
 ATTENTION_TYPE = "bahdanau"
 
+
+
+# ------------------------------------
+# 流式训练与数据加载
+# ------------------------------------
+# 是否启用按 chunk 流式训练；开启后训练会逐块加载数据，并在训练当前块时后台预取下一块
+USE_STREAMING_TRAIN = True
+# 预取下一块开关
+STREAM_PREFETCH = True
+# 预取使用的后台线程数（目前实现仅使用1，保留配置作为未来扩展）
+STREAM_PREFETCH_WORKERS = 1
+# 流式 DataLoader 的工作线程（Windows 建议 0 以避免多进程开销）
+STREAM_DATALOADER_NUM_WORKERS = 0
+
+# ------------------------------------
+# 词表构建参数（用于 build_vocabulary.py 默认值）
+# ------------------------------------
+VOCAB_BUILD_SIZE = 30000
+VOCAB_MIN_FREQ = 2
 
 # ------------------------------------
 # 随机性与日志设置

@@ -57,26 +57,56 @@ def compute_loss(
 
     # 门控损失（若提供标签）
     if gate_target is not None:
-        gate_loss = nn.BCELoss()(gate_pred, gate_target)
+        # 使用 BCEWithLogitsLoss：模型端不做Sigmoid，直接用logits计算
+        gp_logits = gate_pred.view(-1).float()
+        gt = gate_target.view(-1).to(gp_logits.dtype)
+        gate_loss = nn.BCEWithLogitsLoss()(gp_logits, gt)
         loss = loss + gate_loss
 
     # 输出语言损失
-    if target_padded is not None:
-        output_loss = nn.CrossEntropyLoss(ignore_index=config.PAD_token)(output_logits, target_padded)
+    if target_padded is not None and output_logits is not None:
+        ce = nn.CrossEntropyLoss(ignore_index=config.PAD_token)
+        # 兼容不同形状：
+        # - output_logits: (B, V) 与 target: (B) 或 (B, L)
+        # - output_logits: (B, L, V) 与 target: (B, L)
+        if output_logits.dim() == 2:
+            # 模型当前每步只输出一个分布：(B, V)
+            if target_padded.dim() == 2:
+                # 取每个样本目标序列的第一个非PAD词（右侧padding时第0个即可）；
+                # 若该位置为PAD，将被 ignore_index 忽略
+                labels = target_padded[:, 0]
+            else:
+                labels = target_padded
+            output_loss = ce(output_logits, labels.long())
+        elif output_logits.dim() == 3:
+            # 若未来扩展为序列分布：(B, L, V)
+            B, L, V = output_logits.size()
+            logits_flat = output_logits.reshape(B * L, V)
+            if target_padded.dim() == 2:
+                labels_flat = target_padded.reshape(B * L)
+            else:
+                # 广播到每步（不常见，但做兜底）
+                labels_flat = target_padded.view(B, 1).expand(B, L).reshape(B * L)
+            output_loss = ce(logits_flat, labels_flat.long())
+        else:
+            # 其他维度不支持，安全跳过
+            output_loss = torch.tensor(0.0, device=output_logits.device, dtype=output_logits.dtype)
         if not torch.isnan(output_loss):
             loss = loss + output_loss
 
     # 门控熵正则（鼓励适度不确定性/探索）
     ge_w = gate_entropy_weight if gate_entropy_weight is not None else getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0)
     if ge_w and ge_w > 0:
-        p = torch.clamp(gate_pred, 1e-6, 1-1e-6)
-        entropy = -(p*torch.log(p) + (1-p)*torch.log(1-p)).mean()
+        # 使用概率而非logits计算熵
+        p = torch.sigmoid(gate_pred)
+        p = torch.clamp(p, 1e-6, 1 - 1e-6)
+        entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
         loss = loss + ge_w * entropy
 
     # 发声预算约束（控制平均发声比例/思考步）
     tsr = target_speak_ratio if target_speak_ratio is not None else getattr(config, 'TARGET_SPEAK_RATIO', None)
     if tsr is not None:
-        budget_loss = (gate_pred.mean() - float(tsr)).abs()
+        budget_loss = (torch.sigmoid(gate_pred).mean() - float(tsr)).abs()
         loss = loss + 0.1 * budget_loss
 
     # 思考信息量损失（InfoNCE：拉近 h_next 与“正样本”（自身/未来），远离“负样本”（其他样本））

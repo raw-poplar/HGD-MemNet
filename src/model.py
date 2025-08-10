@@ -464,9 +464,8 @@ class StaticHead(nn.Module):
             nn.Linear(concatenated_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),  # 新增：防止过拟合
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
+            nn.Linear(hidden_dim, 1)
+        )  # 输出为logits，损失中使用 BCEWithLogitsLoss
 
         # 2. 输出网络
         self.output_network = nn.Sequential(

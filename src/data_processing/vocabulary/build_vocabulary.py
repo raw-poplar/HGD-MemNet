@@ -39,7 +39,7 @@ from src.dataset import Vocabulary
 class VocabularyBuilder:
     """词汇表构建器"""
     
-    def __init__(self, data_path=None, vocab_size=30000, min_freq=2):
+    def __init__(self, data_path=None, vocab_size=None, min_freq=None):
         """
         初始化词汇表构建器
         
@@ -49,8 +49,8 @@ class VocabularyBuilder:
             min_freq: 最小词频，默认2
         """
         self.data_path = data_path or config.LCCC_PROCESSED_PATH
-        self.vocab_size = vocab_size
-        self.min_freq = min_freq
+        self.vocab_size = vocab_size or getattr(config, 'VOCAB_BUILD_SIZE', 30000)
+        self.min_freq = min_freq or getattr(config, 'VOCAB_MIN_FREQ', 2)
         self.word_counter = Counter()
 
         # 文本预处理：模式与过滤器
@@ -289,10 +289,10 @@ def main():
     parser.add_argument("--data_path", type=str, 
                        default="F:/modelTrain/data/lccc_processed",
                        help="数据文件路径 (默认: F:/modelTrain/data/lccc_processed)")
-    parser.add_argument("--vocab_size", type=int, default=30000,
-                       help="词汇表大小 (默认: 30000)")
-    parser.add_argument("--min_freq", type=int, default=2,
-                       help="最小词频 (默认: 2)")
+    parser.add_argument("--vocab_size", type=int, default=getattr(config, 'VOCAB_BUILD_SIZE', 30000),
+                       help=f"词汇表大小 (默认: {getattr(config, 'VOCAB_BUILD_SIZE', 30000)})")
+    parser.add_argument("--min_freq", type=int, default=getattr(config, 'VOCAB_MIN_FREQ', 2),
+                       help=f"最小词频 (默认: {getattr(config, 'VOCAB_MIN_FREQ', 2)})")
     parser.add_argument("--output", type=str, 
                        help="输出文件路径 (默认: 数据路径下的vocabulary.json)")
     
