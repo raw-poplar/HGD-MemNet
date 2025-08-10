@@ -5,10 +5,31 @@ import torch.nn.functional as F
 import torch.nn.init as init  # 新增 for xavier
 import config
 
+"""
+模块概览：HGD-MemNet 主要组件
+- Attention / MultiHeadAttention: 对编码的参照序列 x_ref 执行注意力聚合，支持 padding mask。
+- DynamicGroup: 编码 x_t 与 x_ref，利用注意力/池化得到上下文，并交给核心 RNN（ReservoirRNNCell）演化隐藏状态。
+- ReservoirRNNCell: 通过 Gumbel-Softmax 对隐藏单元的入连接进行可微选择（训练软采样、推理可硬采样）；
+  同时在训练时积累 Hebbian/usage 统计以驱动剪枝与再生长。
+- StaticHead: 从动态组隐藏状态中做“固定+随机”子采样（训练可用近似可微 Top-k），与上下文拼接后输出门控与 logits。
+
+注意：
+- 模型会基于 config.PAD_token 自动构造注意力 mask，避免 PAD 影响注意力分布；
+- 训练循环内注入温度退火与（可选）周期性剪枝/再生长，详见 src/train.py。
+"""
+
+
 # --- 注意力模块 ---
 class Attention(nn.Module):
     """
     标准的 Bahdanau 注意力机制
+    - 输入：
+    - query: (B, H) 当前步的查询（通常是上一步隐藏状态 h_prev）
+    - keys:  (B, L, H) 编码器输出序列（作为注意力的 key/value）
+    - mask:  (B, L) 可选，True 表示有效 token，False 表示 padding；若提供将避免将 padding 纳入 softmax
+    - 输出：
+    - context: (B, H) 按注意力权重加权后的上下文向量
+    - attn_weights: (B, L) 每个时间步的注意力分布
     """
     def __init__(self, hidden_dim):
         super(Attention, self).__init__()
@@ -16,11 +37,12 @@ class Attention(nn.Module):
         self.Ua = nn.Linear(hidden_dim, hidden_dim)
         self.Va = nn.Linear(hidden_dim, 1)
 
-    def forward(self, query, keys):
+    def forward(self, query, keys, mask=None):
         """
         Args:
             query (torch.Tensor): 上一步的解码器隐藏状态 (h_prev), shape: (batch_size, hidden_dim)
             keys (torch.Tensor): 编码器的所有输出 (x_ref_encoded), shape: (batch_size, seq_len, hidden_dim)
+            mask (torch.BoolTensor, optional): 有效位置为 True 的 padding 掩码，shape: (batch_size, seq_len)
 
         Returns:
             context (torch.Tensor): 上下文向量, shape: (batch_size, hidden_dim)
@@ -29,14 +51,17 @@ class Attention(nn.Module):
         # query shape: (batch_size, 1, hidden_dim)
         # keys shape: (batch_size, seq_len, hidden_dim)
         scores = self.Va(torch.tanh(self.Wa(query.unsqueeze(1)) + self.Ua(keys)))
-        scores = scores.squeeze(2) # (batch_size, seq_len)
+        scores = scores.squeeze(2)  # (batch_size, seq_len)
+
+        if mask is not None:
+            # 将被mask的位置设为 -inf，softmax 后权重为0
+            scores = scores.masked_fill(~mask, float('-inf'))
 
         attn_weights = F.softmax(scores, dim=1)
 
-        # context = bmm(attn_weights.unsqueeze(1), keys)
         # context shape: (batch_size, 1, hidden_dim)
         context = torch.bmm(attn_weights.unsqueeze(1), keys)
-        context = context.squeeze(1) # (batch_size, hidden_dim)
+        context = context.squeeze(1)  # (batch_size, hidden_dim)
 
         return context, attn_weights
 
@@ -44,7 +69,10 @@ class Attention(nn.Module):
 # --- 多头注意力模块 ---
 class MultiHeadAttention(nn.Module):
     """
-    多头注意力机制
+    多头注意力机制（单步 query, 序列 keys）
+    - 输入：query: (B, H)、keys: (B, L, H)、mask: (B, L)
+    - 实现：标准缩放点积注意力 + 残差 + LayerNorm；支持温度与 dropout。
+    - 输出：context: (B, H)，attn_weights: (B, num_heads, L)
     """
     def __init__(self, hidden_dim, num_heads, dropout=0.1, use_bias=True, temperature=1.0):
         super(MultiHeadAttention, self).__init__()
@@ -64,15 +92,16 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, query, keys):
+    def forward(self, query, keys, mask=None):
         """
         Args:
             query (torch.Tensor): shape: (batch_size, hidden_dim)
             keys (torch.Tensor): shape: (batch_size, seq_len, hidden_dim)
+            mask (torch.BoolTensor, optional): 有效位置为 True 的 padding 掩码，shape: (batch_size, seq_len)
 
         Returns:
             context (torch.Tensor): shape: (batch_size, hidden_dim)
-            attn_weights (torch.Tensor): shape: (batch_size, num_heads, 1, seq_len)
+            attn_weights (torch.Tensor): shape: (batch_size, num_heads, seq_len)
         """
         batch_size, seq_len, _ = keys.shape
 
@@ -92,8 +121,12 @@ class MultiHeadAttention(nn.Module):
         # 计算注意力分数
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5 * self.temperature)  # (batch_size, num_heads, 1, seq_len)
 
-        # 数值稳定性检查
-        scores = torch.clamp(scores, min=-50, max=50)  # 防止溢出
+        if mask is not None:
+            # 扩展 mask 以匹配多头形状: (B, 1, 1, L)
+            mask_exp = mask.unsqueeze(1).unsqueeze(1)  # bool
+            scores = scores.masked_fill(~mask_exp, float('-inf'))
+
+        # 数值稳定性：softmax 之前处理掩码
         attn_weights = F.softmax(scores, dim=-1)
 
         # 检查并修复NaN或无效值
@@ -151,118 +184,90 @@ class AttentionFactory:
 
 # --- 新: 可训练的“蓄水池”式RNN单元 ---
 class ReservoirRNNCell(nn.Module):
+    """
+    一个“蓄水池”式、可训练的 RNN 单元：
+    - 通过 Gumbel-Softmax 在每个输出神经元行上对输入隐藏单元进行“软选择/硬采样”；
+    - 支持温度 τ（可学习或外部传入）控制探索-利用；
+    - 在训练态以 EMA 方式积累 Hebbian 与使用频度统计，供剪枝/再生长策略使用。
+    """
     def __init__(self, input_size, hidden_size, initial_temperature=1.0, use_hard_sampling=False):
         """
-        初始化 ReservoirRNNCell：高级版带有温度采样的可训练RNN单元，模拟概率驱动的数据交换。
-
-        新增：initial_temperature - 初始温度参数。
-
         Args:
             input_size (int): 输入维度。
             hidden_size (int): 隐藏状态维度（神经元数量）。
-            initial_temperature (float): 初始温度参数，控制采样随机性（>1: 更随机；<1: 更确定）。默认1.0（标准softmax）。
-            use_hard_sampling (bool): 是否在 forward 中使用硬采样。默认False（软采样）。
+            initial_temperature (float): 初始温度参数，控制采样随机性（>1: 更随机；<1: 更确定）。默认1.0。
+            use_hard_sampling (bool): 是否在 forward 中使用硬采样。默认 False（训练建议软采样）。
         """
         super(ReservoirRNNCell, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.temperature = nn.Parameter(torch.tensor(initial_temperature))  # 改为可学习参数，支持退火
+        self.temperature = nn.Parameter(torch.tensor(initial_temperature))  # 可学习温度（也可被 forward 参数覆盖）
         self.use_hard_sampling = use_hard_sampling
         self.W_ih = nn.Linear(input_size, hidden_size, bias=True)
-        # 可训练权重矩阵：(hidden_out, hidden_in)，每个行代表一个输出神经元的出边权重到输入神经元。
+        # 可训练的“隐藏-隐藏”权重矩阵：(hidden_out, hidden_in)，行表示从所有输入隐藏单元聚合到该输出单元的权重。
         self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        init.xavier_uniform_(self.W_hh_matrix)  # 优化初始化 for 稳定性
-        # 剪枝与再生长：连接掩码与统计缓冲（赫布分数/使用频度）
+        init.xavier_uniform_(self.W_hh_matrix)  # Xavier 初始化提高稳定性
+        # 剪枝与再生长相关：连接掩码与统计缓冲（赫布分数/使用频度）
         self.register_buffer("hh_mask", torch.ones(hidden_size, hidden_size))
         self.register_buffer("hebb_score", torch.zeros(hidden_size, hidden_size))
-        self.register_buffer("usage_score", torch.zeros(hidden_size, hidden_size))  # gumbel 概率的EMA
+        self.register_buffer("usage_score", torch.zeros(hidden_size, hidden_size))  # 记录 gumbel 选择概率的 EMA
 
     def forward(self, x_t, h_prev, temperature=None):
         """
-        前向传播：高级版使用温度调整的 Gumbel-Softmax 采样更新隐藏状态。
+        使用 Gumbel-Softmax 的可微“连接选择”来进行隐藏状态更新。
+        - 训练时默认软采样（hard=False），以获得平滑梯度；
+        - 推理/验证可切到硬采样（hard=True）以获得更确定的行为。
 
-        高级特性：
-        - 支持动态温度（通过可选参数传入，覆盖 self.temperature）。
-        - 可切换硬/软采样：硬采样 (hard=True) 生成离散 one-hot 向量（适合推理）；软采样 (hard=False) 生成连续近似（适合训练，反向传播友好）。
-        - 数学原理：Gumbel-Softmax 是对分类分布的连续松弛，使用 Gumbel 噪声模拟采样过程。公式：y_i = softmax((log π_i + g_i) / τ)，其中 g_i ~ Gumbel(0,1)，τ 是温度。
-        - 影响：高温τ增加熵（多样性），低温τ减少熵（确定性）。如果τ→0，退化为 argmax（需小心除零）。
-        - 边缘处理：如果 temperature <=0，使用 argmax 作为近似硬采样。
-        - 警告：高温 (tau >1) 可能增加训练方差，导致不稳定；建议从小值开始实验。
-
-        逻辑：
-        1. 计算输入贡献 (不变)。
-        2. 准备 logits - 应用温度缩放 (1, hidden_out, hidden_in)。
-        3. 使用 Gumbel-Softmax 进行可微采样（重复到批次维度）。
-        4. 计算每个输出神经元的贡献：采样权重与 h_prev 的加权和（使用 einsum 高效实现）。
-        5. 组合输入贡献并应用 tanh 激活生成 h_next。
-
-        这实现了概率数据交换：高温增加低概率连接的选中率，促进探索；低温偏向高概率连接，确保稳定性。
-        Gumbel-Softmax 确保采样过程可微，便于端到端训练。
-
-        Args:
-            x_t (torch.Tensor): 当前输入，shape: (batch_size, input_size)
-            h_prev (torch.Tensor): 上一步隐藏状态，shape: (batch_size, hidden_size)
-            temperature (float, optional): 覆盖 self.temperature 的动态温度。默认None（使用 self.temperature）。
-
-        Returns:
-            h_next (torch.Tensor): 新隐藏状态，shape: (batch_size, hidden_size)
+        数学背景（每个输出单元 o 对输入隐藏单元 h 的选择）：
+        y = softmax((log π + gumbel()) / τ)
+        h_o = Σ_h y_{o,h} * h_prev_h
+        其中 τ 为温度；τ↓ → 更接近 argmax；τ↑ → 更平滑/高熵。
         """
         batch_size = h_prev.size(0)
 
-        # 使用动态温度，如果提供；否则使用可学习的实例温度（保持可导）
+        # 使用动态温度（外部优先），并对 τ 做下限裁剪以避免除零
         if temperature is not None:
             tau_tensor = torch.as_tensor(temperature, device=h_prev.device, dtype=self.W_hh_matrix.dtype)
         else:
             tau_tensor = self.temperature
+        tau_tensor = torch.clamp(tau_tensor, min=1e-5)
 
-        # 确定是否使用硬采样
-        hard = self.use_hard_sampling
-        if (temperature is not None) and (float(temperature) <= 0):
-            # 边缘案例：低温极限，使用 argmax 作为硬采样近似
-            hard = True
-            tau_tensor = torch.clamp(tau_tensor, min=1e-5)
-        else:
-            tau_tensor = torch.clamp(tau_tensor, min=1e-5)
+        # 训练态强制软采样，有助于稳定反传；推理可允许硬采样
+        hard = False if self.training else self.use_hard_sampling
 
-        if self.training:
-            hard = False  # 训练时强制软采样，确保梯度平滑
-
-        # 步骤1: 计算输入到隐藏的贡献 (batch, hidden)
+        # 1) 输入到隐藏的贡献
         input_contrib = self.W_ih(x_t)
 
-        # 步骤2: 准备 logits - 应用温度缩放 (1, hidden_out, hidden_in)
+        # 2) 构造 logits（将 τ 融入缩放），并为批量扩展：shape (B, H_out, H_in)
         effective = (self.W_hh_matrix * self.hh_mask) / tau_tensor
-        logits = effective.unsqueeze(0)
+        logits = effective.unsqueeze(0).repeat(batch_size, 1, 1)
 
-        # 步骤3: 矢量化 Gumbel-Softmax 采样 - 重复到批次维度 (batch, hidden_out, hidden_in)
-        # 公式: y_i = softmax((log π_i + g_i) / τ)
-        # 为了保持 tau 的可学习性，我们将温度并入 logits 缩放，这里将 gumbel_softmax 的 tau 固定为1.0
-        gumbel_samples = F.gumbel_softmax(logits.repeat(batch_size, 1, 1), tau=1.0, hard=hard, dim=2)
+        # 3) 基于 Gumbel-Softmax 的“连接选择”权重
+        gumbel_samples = F.gumbel_softmax(logits, tau=1.0, hard=hard, dim=2)
 
-        # 使用频度统计（EMA）：每条连接在本批次被采样的“概率”均值
+        # 使用频度的 EMA 统计（仅训练态），用于后续剪枝/再生长
         if self.training:
             with torch.no_grad():
-                usage_batch = gumbel_samples.mean(dim=0)  # (hidden_out, hidden_in)
+                usage_batch = gumbel_samples.mean(dim=0)  # (H_out, H_in)
                 ubeta = getattr(config, 'USAGE_EMA_BETA', getattr(config, 'HEBB_EMA_BETA', 0.9))
                 self.usage_score.mul_(ubeta).add_((1.0 - ubeta) * usage_batch)
 
-        # 步骤4: 计算贡献 - einsum 高效矩阵乘法：sum over input neurons (batch, hidden_out)
+        # 4) 聚合上一步隐藏状态：h_prev ∈ (B, H_in)
         if self.hidden_size > 512:
-            contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)  # 替代以加速大矩阵
+            contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)
         else:
             contrib = torch.einsum('boh,bh->bo', gumbel_samples, h_prev)
 
-        # 步骤5：计算 h_next（用于前向与赫布统计）
+        # 5) 激活得到 h_next，并积累 Hebbian 统计
         h_preact = input_contrib + contrib
         h_next = torch.tanh(h_preact)
 
-        # 赫布×使用频度 统计：仅在训练态统计 EMA
         if self.training:
             with torch.no_grad():
-                pre = h_prev.abs()                  # (batch, hidden_in)
-                post = h_next.abs()                 # (batch, hidden_out)
+                pre = h_prev.abs()                  # (B, H_in)
+                post = h_next.abs()                 # (B, H_out)
                 hebb_batch = torch.einsum('bo,bh->oh', post, pre) / max(1, h_prev.size(0))
-                usage_batch = gumbel_samples.mean(dim=0)  # (hidden_out, hidden_in) 软选择概率的均值
+                usage_batch = gumbel_samples.mean(dim=0)
                 beta = getattr(config, 'HEBB_EMA_BETA', 0.9)
                 self.hebb_score.mul_(beta).add_((1.0 - beta) * hebb_batch)
                 self.usage_score.mul_(beta).add_((1.0 - beta) * usage_batch)
@@ -327,8 +332,9 @@ class ReservoirRNNCell(nn.Module):
 # --- 动态神经组 (核心演化模块) ---
 class DynamicGroup(nn.Module):
     """
-    模型的核心，一个动态演化的神经组。
-    核心RNN被替换为ReservoirRNNCell以匹配描述。
+    模型的核心：编码 x_ref、根据 h_prev 与（可选）注意力得到上下文，再与编码后的 x_t 拼接交给核心 RNN。
+    - 支持多种注意力机制；无注意力时退化为对历史的 mask 平均池化。
+    - 核心 RNN 使用 ReservoirRNNCell（可微采样 + 稀疏演化接口）。
     """
     def __init__(self, embed_dim, hidden_dim, num_attention_heads=1, attention_config=None):
         super(DynamicGroup, self).__init__()
@@ -365,13 +371,14 @@ class DynamicGroup(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)  # 新增：LayerNorm for RNN输出
 
-    def forward(self, x_t, x_ref_encoded, h_prev, temperature=None):
+    def forward(self, x_t, x_ref_encoded, h_prev, temperature=None, x_ref_mask=None):
         """
         Args:
             x_t (torch.Tensor): 当前时间步的输入, shape: (batch_size, seq_len, embed_dim)
             x_ref_encoded (torch.Tensor): 经过编码的参照输入, shape: (batch_size, ref_seq_len, hidden_dim)
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch_size, hidden_dim)
             temperature (float, optional): 温度参数，传递给核心RNN
+            x_ref_mask (torch.BoolTensor, optional): 参照序列的有效位置掩码，True 表示有效 token，shape: (batch_size, ref_seq_len)
 
         Returns:
             h_next (torch.Tensor): 当前步的输出隐藏状态, shape: (batch_size, hidden_dim)
@@ -388,11 +395,16 @@ class DynamicGroup(nn.Module):
         if self.attention is not None:
             # 使用注意力机制计算上下文向量
             # h_prev 是 query, x_ref_encoded 是 keys
-            context, _ = self.attention(h_prev, x_ref_encoded)  # 忽略注意力权重
+            context, _ = self.attention(h_prev, x_ref_encoded, mask=x_ref_mask)  # 忽略注意力权重
         else:
             # 无注意力版本：使用历史信息的全局表示
             # 简单的平均池化 + 线性投影
-            history_pooled = torch.mean(x_ref_encoded, dim=1)  # (batch_size, hidden_dim)
+            if x_ref_mask is not None:
+                # 避免将 padding 位计入平均
+                lengths = x_ref_mask.sum(dim=1).clamp(min=1).unsqueeze(1)  # (B,1)
+                history_pooled = (x_ref_encoded * x_ref_mask.unsqueeze(-1)).sum(dim=1) / lengths
+            else:
+                history_pooled = torch.mean(x_ref_encoded, dim=1)  # (batch_size, hidden_dim)
             context = self.history_projector(history_pooled)  # (batch_size, hidden_dim)
 
         # 2. 将上下文向量和当前输入拼接
@@ -411,14 +423,17 @@ class DynamicGroup(nn.Module):
 # --- 静态网络对 (决策模块) ---
 class StaticHead(nn.Module):
     """
-    静态网络对 (决策前端)
-    根据描述重构：从动态组的输出中进行固定和随机采样。
+    静态网络对（决策前端）：从动态组隐藏状态中抽取“固定 + 随机”子集，再与上下文拼接，输出门控与分类 logits。
+    - 固定采样：取前 num_fixed 个维度（可视作保留主干单元）。
+    - 随机采样：在剩余维度中按学习到的 logits 选择 top‑k（训练可用近似可微 Top‑k，推理用硬采样）。
+    - 评分增强：可选将注意力上下文拼入评分器（use_contextual_sampler），提升“在何种上下文下采哪类单元”的表达。
     """
-    def __init__(self, hidden_dim, sampler_input_dim, context_input_dim, output_dim, fixed_ratio, random_ratio, use_soft_topk_training=True):
+    def __init__(self, hidden_dim, sampler_input_dim, context_input_dim, output_dim, fixed_ratio, random_ratio, use_soft_topk_training=True, use_contextual_sampler=True):
         super(StaticHead, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.use_soft_topk_training = use_soft_topk_training
+        self.use_contextual_sampler = use_contextual_sampler
 
         # 计算采样数量
         self.num_fixed = int(sampler_input_dim * fixed_ratio)
@@ -430,7 +445,16 @@ class StaticHead(nn.Module):
         if self.random_pool_dim < self.num_random:
             raise ValueError("Random sampling pool is smaller than the number of items to sample.")
 
-        self.random_sampler = nn.Linear(self.random_pool_dim, self.random_pool_dim)  # 修正: 输出维度应为池大小
+        # 采样评分器：可选择上下文增强
+        if self.use_contextual_sampler:
+            # 使用上下文 (context) + 剩余状态作为评分输入
+            self.sampler_scorer = nn.Sequential(
+                nn.Linear(self.random_pool_dim + context_input_dim, max(64, self.random_pool_dim // 2)),
+                nn.ReLU(),
+                nn.Linear(max(64, self.random_pool_dim // 2), self.random_pool_dim)
+            )
+        else:
+            self.random_sampler = nn.Linear(self.random_pool_dim, self.random_pool_dim)
 
         # 拼接后的维度：采样状态 + 注意力上下文
         concatenated_dim = self.sampler_output_dim + context_input_dim
@@ -464,7 +488,12 @@ class StaticHead(nn.Module):
         # 2. 随机采样 (从剩余的神经元池中)
         random_pool = h_from_dynamic[:, self.num_fixed:]
 
-        sampling_logits = self.random_sampler(random_pool)  # 生成采样logits (batch, random_pool_dim)
+        # 评分器：可上下文增强
+        if getattr(self, 'sampler_scorer', None) is not None:
+            scorer_in = torch.cat([random_pool, attn_context], dim=1)
+            sampling_logits = self.sampler_scorer(scorer_in)
+        else:
+            sampling_logits = self.random_sampler(random_pool)
 
         # 近似可微的Top-k选择：使用Gumbel-Softmax扰动后取top-k索引（推理可用硬采样）
         if self.training and self.use_soft_topk_training:
@@ -537,7 +566,8 @@ class HGD_MemNet(nn.Module):
             output_dim=vocab_size,
             fixed_ratio=config.FIXED_SAMPLING_RATIO,
             random_ratio=config.RANDOM_SAMPLING_RATIO,
-            use_soft_topk_training=getattr(config, 'USE_SOFT_TOPK_TRAINING', True)
+            use_soft_topk_training=getattr(config, 'USE_SOFT_TOPK_TRAINING', True),
+            use_contextual_sampler=getattr(config, 'USE_CONTEXTUAL_SAMPLER', True)
         )
 
     def forward(self, x_t, x_ref, h_prev, temperature=None, control=None):
@@ -561,13 +591,16 @@ class HGD_MemNet(nn.Module):
         x_t_embedded = self.embed(x_t) if x_t is not None else None
         x_ref_embedded = self.embed(x_ref)
 
+        # 1.1 构建 padding 掩码：True=有效，False=padding
+        x_ref_mask = (x_ref != config.PAD_token) if x_ref is not None else None
+
         # 2. 编码参照输入 x_ref 来为注意力机制和上下文向量做准备
         # encoder_outputs shape: (batch_size, ref_seq_len, dynamic_hidden_dim)
         encoder_outputs, _ = self.dynamic_group.encoder_rnn(x_ref_embedded)
 
         # 3. 通过动态组进行一步演化
         # 传入编码后的x_ref作为key, 获得下一步的隐藏状态和该步的注意力上下文
-        h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev, temperature)
+        h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev, temperature, x_ref_mask=x_ref_mask)
 
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)

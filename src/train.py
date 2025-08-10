@@ -30,9 +30,17 @@ if getattr(config, 'DETERMINISTIC', False):
 
 def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     """
-    按照描述进行训练：在每个“思考步骤”中都进行一次损失计算和反向传播，
-    并动态调整学习率。
-    返回：batch_loss, steps_updated(思考步数), gate_mean, gate_entropy, cap_hit(0/1)
+    以“内部思考步”为核心的训练过程：
+    - 对同一个样本序列，逐步推进 t=1..T；每步都计算损失并反传；
+    - 在步内衰减学习率（INNER_STEP_LR_DECAY），并对 ReservoirRNNCell 施加温度退火；
+    - 可选启用基于门控阈值的早停（USE_GATED_MULTISTEP）。
+
+    返回：
+        total_batch_loss: 本 batch 所有内部步损失之和（标量）
+        steps_updated: 实际反向更新的步数
+        gate_mean: 门控均值（用于监控）
+        gate_entropy: 门控熵（用于监控/正则）
+        cap_hit: 是否由最大步 cap 截断（0/1）
     """
     model.train()
     x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
