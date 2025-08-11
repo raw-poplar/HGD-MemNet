@@ -569,6 +569,12 @@ class HGD_MemNet(nn.Module):
             use_contextual_sampler=getattr(config, 'USE_CONTEXTUAL_SAMPLER', True)
         )
 
+        # 序列级 CE（可选）：简单 Teacher-Forcing 解码器
+        self.use_sequence_ce = getattr(config, 'USE_SEQUENCE_CE', False)
+        if self.use_sequence_ce:
+            self.seq_decoder = nn.GRU(embed_dim, dynamic_hidden_dim, batch_first=True)
+            self.seq_out = nn.Linear(dynamic_hidden_dim, vocab_size)
+
     def forward(self, x_t, x_ref, h_prev, temperature=None, control=None):
         """
         一次完整的思考步骤
@@ -604,14 +610,20 @@ class HGD_MemNet(nn.Module):
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)
 
+        # 4.1 若启用序列级 CE，则用简单 GRU 解码器进行 Teacher-Forcing，输出 (B, L, V)
+        seq_logits = None
+        if self.use_sequence_ce and (x_t_embedded is not None):
+            # 使用 x_t 的嵌入作为 Teacher-Forcing 输入
+            dec_h0 = h_next.unsqueeze(0)  # (1, B, H)
+            dec_out, _ = self.seq_decoder(x_t_embedded, dec_h0)  # (B, L, H)
+            seq_logits = self.seq_out(dec_out)         # (B, L, V)
+
         # 5. 可选：使用控制向量对门控进行无参数微调（不破坏可导性）
         if control is not None:
             try:
                 alpha = getattr(config, 'CONTROL_GATE_ALPHA', 0.0)
                 if alpha and alpha > 0:
-                    # 简单策略：将 control 压缩到 [0,1]，与 gate_pred 融合
                     c = torch.sigmoid(torch.nan_to_num(control, nan=0.0))
-                    # 对齐 batch 维；若 control 维度不匹配，取均值作为标量权重
                     if c.dim() == 2 and c.size(0) == gate_pred.size(0):
                         c_val = c.mean(dim=1, keepdim=True)
                     else:
@@ -620,6 +632,9 @@ class HGD_MemNet(nn.Module):
             except Exception:
                 pass
 
+        # 返回序列级 logits（若启用）以便 compute_loss 使用
+        if self.use_sequence_ce:
+            return h_next, gate_pred, (seq_logits if seq_logits is not None else output_logits)
         return h_next, gate_pred, output_logits
 
 

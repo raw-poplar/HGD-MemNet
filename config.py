@@ -128,9 +128,15 @@ MAX_THINKING_STEPS = -1
 # 安全兜底，防止极端情况下长时间不发声
 SAFETY_MAX_THINKING_STEPS = 64
 
-# LEARNING_RATE: 初始学习率；LR_DECAY_RATE: 轮级别的学习率衰减（train.py中通过StepLR示例）。
-LEARNING_RATE = 0.001
-LR_DECAY_RATE = 0.95
+# 优化器/调度（优化2）：AdamW + ReduceLROnPlateau
+OPTIMIZER = "adamw"          # "adam" / "adamw"
+LEARNING_RATE = 3e-4          # 由 1e-3 调低，更稳
+WEIGHT_DECAY = 1e-2           # AdamW 默认较大的权重衰减
+LR_SCHEDULER = "plateau"     # "none" / "step" / "plateau"
+LR_DECAY_RATE = 0.95          # 仅 step 有效
+LR_PLATEAU_PATIENCE = 5       # plateau 参数：忍耐次数
+LR_PLATEAU_FACTOR = 0.5       # 降学习率因子
+LR_PLATEAU_MIN_LR = 1e-6
 
 # NUM_EPOCHS: 总训练轮数；INNER_STEP_LR_DECAY: 同一个batch内部，随思考步 t 衰减学习率的因子。
 NUM_EPOCHS = 20
@@ -143,6 +149,9 @@ INNER_STEP_LR_DECAY = 0.95
 INITIAL_TEMPERATURE = 1.5
 TEMPERATURE_DECAY = 0.95
 MIN_TEMPERATURE = 0.1
+
+# 强化“思考表征”的学习（优化4）
+THINK_LOSS_WEIGHT = 0.05  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
 
 # ------------------------------------
 # 注意力机制相关参数
@@ -205,6 +214,11 @@ USE_TENSORBOARD = False
 TENSORBOARD_LOG_DIR = "./runs"
 USE_CSV_LOGGER = True
 CSV_LOG_PATH = "./logs/train_metrics.csv"
+# CSV 列扩展（分项指标）将自动写入：token_ce、gate_bce、think_nce
+
+# THINK_LOSS warmup 步数（0 表示关闭）。建议设为若干验证间隔的总步数，如 5*VALIDATE_EVERY_N_STEPS
+# 注意：需在 VALIDATE_EVERY_N_STEPS 定义之后设置；此处仅占位，真正值在下方定义
+THINK_WARMUP_STEPS = None
 
 
 # ------------------------------------
@@ -215,6 +229,10 @@ VALIDATE_EVERY_N_STEPS = 2000
 # 可选：验证时仅抽样固定数量的对话（0 表示禁用抽样，使用全量）。
 VALIDATE_SAMPLE_SIZE = 1000           # 示例：设为 1000 可大幅缩短验证时间
 VALIDATE_SHUFFLE_WHEN_SUBSAMPLE = True  # 抽样时是否打乱验证集顺序
+
+# THINK_LOSS warmup 步数的实际值（默认 5 次验证间隔）
+if THINK_WARMUP_STEPS is None:
+    THINK_WARMUP_STEPS = 5 * VALIDATE_EVERY_N_STEPS
 
 # BEST_MODEL_DIR: 保存验证集最优模型权重的目录。
 BEST_MODEL_DIR = "./best_model"
@@ -242,11 +260,14 @@ TARGET_SPEAK_RATIO = 0.2
 # 门控熵正则权重（鼓励适度不确定性，防止塌缩）
 GATE_ENTROPY_WEIGHT = 1e-3
 # 思考信息量损失（InfoNCE 等）的权重（0 表示关闭）
-THINK_LOSS_WEIGHT = 0.0
+# 注意：上方已设置 THINK_LOSS_WEIGHT = 0.05（优化4）
 # InfoNCE 温度
 THINK_INFO_TAU = 0.1
 # 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
 CONTROL_GATE_ALPHA = 0.0
+
+# 是否启用序列级 CE（开启后模型返回 (B, L, V) 并对每个 token 计算CE）
+USE_SEQUENCE_CE = True
 
 
 # USE_GATED_MULTISTEP: 是否启用“门控多步思考”早停（训练循环中当 gate>=阈值时提前跳出该样本的内部步）。

@@ -7,7 +7,6 @@ import os
 import glob
 from tqdm import tqdm
 from torch.amp import GradScaler
-import time
 
 # 新增：性能优化
 import torch.backends.cudnn as cudnn
@@ -35,7 +34,7 @@ if getattr(config, 'DETERMINISTIC', False):
     cudnn.benchmark = False
     cudnn.deterministic = True
 
-def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
+def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps: int = 0):
     """
     以“内部思考步”为核心的训练过程：
     - 对同一个样本序列，逐步推进 t=1..T；每步都计算损失并反传；
@@ -59,6 +58,15 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     gate_entropy_acc = 0.0
     gate_obs = 0
     ended_by_cap = False
+
+    # 分项损失累计（步平均）
+    comps_acc = {
+        'gate_bce': 0.0,
+        'token_ce': 0.0,
+        'gate_entropy_reg': 0.0,
+        'budget_reg': 0.0,
+        'think_nce': 0.0,
+    }
 
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
@@ -111,14 +119,29 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
             gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
             gate_obs += 1
 
-            step_loss = compute_loss(
+            # THINK_LOSS warmup：前 N 步内线性升温
+            warmup_steps = int(getattr(config, 'THINK_WARMUP_STEPS', 0) or 0)
+            tlw_cfg = float(getattr(config, 'THINK_LOSS_WEIGHT', 0.0) or 0.0)
+            if warmup_steps > 0 and tlw_cfg > 0:
+                tlw_eff = tlw_cfg * min(1.0, (global_total_steps + steps_updated + 1) / warmup_steps)
+            else:
+                tlw_eff = tlw_cfg
+
+            step_loss, comps = compute_loss(
                 gate_pred, gate_target, output_logits, target_padded,
                 gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                 target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                 h_prev=h_prev, h_next=h_next,
-                think_loss_weight=getattr(config, 'THINK_LOSS_WEIGHT', 0.0),
+                think_loss_weight=tlw_eff,
                 info_nce_tau=getattr(config, 'THINK_INFO_TAU', 0.1),
+                return_components=True,
             )
+            # 累计分项
+            try:
+                for k in comps_acc.keys():
+                    comps_acc[k] += comps.get(k, 0.0)
+            except Exception:
+                pass
 
         scaler.scale(step_loss).backward()
         scaler.unscale_(optimizer)
@@ -154,7 +177,10 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler):
     gate_mean = (gate_mean_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
     gate_entropy = (gate_entropy_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
 
-    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap)
+    # 分项平均（按步）
+    comps_avg = {k: (v / max(1, steps_updated)) for k, v in comps_acc.items()}
+
+    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap), comps_avg
 
 # 剪枝/再生长：按配置周期触发（最小实现，模块级函数）
 def maybe_prune_regrow(model, total_steps):
@@ -287,13 +313,17 @@ def validate_model(model):
 
                                 h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
 
-                                step_loss = compute_loss(
+                                step_loss, comps = compute_loss(
                                     gate_pred, g_t, output_logits, y_t,
                                     gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                                     target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                                    return_components=True,
                                 )
 
                                 total_val_loss += step_loss.item()
+                                # 记录到 CSV（验证分项）：标注 split=val
+                                if csv_writer is not None:
+                                    csv_writer.writerow([epoch+1, total_steps, step_loss.item(), optimizer.param_groups[0]['lr'], '', f"{comps.get('token_ce', 0.0):.6f}", f"{comps.get('gate_bce', 0.0):.6f}", f"{comps.get('think_nce', 0.0):.6f}", 'val'])
                                 h_prev = h_next
                                 total_steps += 1
                         seen_samples += len(val_dataset)
@@ -401,15 +431,16 @@ def test_model(model):
 
                                 h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
 
-                                step_loss = compute_loss(
+                                step_loss, comps = compute_loss(
                                     gate_pred, g_t, output_logits, y_t,
                                     gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                                     target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
+                                    return_components=True,
                                 )
 
                                 total_test_loss += step_loss.item()
                                 h_prev = h_next
-                                total_steps += 1
+                                total_steps += 1  # 可选：这里也可以累计 comps 以打印更细测试分项
                     finally:
                         del chunk_data
                         gc.collect()
@@ -492,19 +523,35 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
 
     latest_checkpoint_path = max(checkpoints, key=os.path.getmtime)
     print(f"正在从最新的检查点加载: {latest_checkpoint_path}")
-    checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE)
+    # 显式指定 weights_only=False（我们需要优化器/Scaler等对象）；未来可改为安全加载仅权重
+    checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE, weights_only=False)
 
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    # 将优化器状态迁移到当前设备
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(DEVICE)
-    if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    # 允许部分加载（序列CE等新模块在旧权重中缺失）
+    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 将优化器状态迁移到当前设备
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(DEVICE)
+    except Exception as e:
+        print(f"警告：优化器状态加载失败（可能是优化器类型变化）。将使用新优化器。详情: {e}")
+    if 'scaler_state_dict' in checkpoint:
+        try:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        except Exception:
+            pass
 
     start_epoch = checkpoint.get('epoch', 0)
     total_steps = checkpoint.get('total_steps', 0)
+
+    # 打印部分加载信息
+    try:
+        if missing or unexpected:
+            print(f"提示：部分权重未匹配。missing={len(missing)} unexpected={len(unexpected)}")
+    except Exception:
+        pass
 
     print(f"已从 '{latest_checkpoint_path}' 加载 (轮次 {start_epoch}, 总步数 {total_steps})。")
     return start_epoch, total_steps
@@ -547,7 +594,11 @@ def train_model():
 
         print("注意：由于动态学习率调整，模型JIT脚本化已被禁用。")
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-5)  # 新增：L2正则
+        # 优化器（优化2）：AdamW 默认 + Adam 兼容
+        if getattr(config, 'OPTIMIZER', 'adam').lower() == 'adamw':
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-2))
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-5))
         scaler = GradScaler(enabled=torch.cuda.is_available())
 
         start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
@@ -556,8 +607,20 @@ def train_model():
 
         best_val_loss = float('inf')
 
-        # 新增：全局学习率调度器
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)  # 每轮衰减
+        # 学习率调度器（优化2）：step/plateau 按配置选择
+        if getattr(config, 'LR_SCHEDULER', 'none').lower() == 'step':
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=getattr(config, 'LR_DECAY_RATE', 0.95))
+        elif getattr(config, 'LR_SCHEDULER', 'none').lower() == 'plateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=getattr(config, 'LR_PLATEAU_FACTOR', 0.5),
+                patience=getattr(config, 'LR_PLATEAU_PATIENCE', 5),
+                min_lr=getattr(config, 'LR_PLATEAU_MIN_LR', 1e-6),
+                verbose=True,
+            )
+        else:
+            scheduler = None
 
         # 统一随机种子（如设置）
         from datetime import datetime
@@ -590,7 +653,7 @@ def train_model():
             csv_writer = csv.writer(csv_f)
             # 写入表头（若为空）
             if csv_f.tell() == 0:
-                csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean'])
+                csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean', 'token_ce', 'gate_bce', 'think_nce', 'split'])
 
         for epoch in range(start_epoch, config.NUM_EPOCHS):
             if getattr(config, 'USE_STREAMING_TRAIN', True):
@@ -608,13 +671,16 @@ def train_model():
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(
-                                x_ref_padded, steps_data, model, optimizer, scaler
+                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
+                                x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
                             )
                             total_steps += steps_in_batch
                             avg_loss = batch_loss / max(1, steps_in_batch)
                             pbar.set_postfix({
                                 "平均步损失": f"{avg_loss:.4f}",
+                                "token_ce": f"{comps_avg.get('token_ce', 0.0):.4f}",
+                                "gate_bce": f"{comps_avg.get('gate_bce', 0.0):.4f}",
+                                "think_nce": f"{comps_avg.get('think_nce', 0.0):.4f}",
                                 "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                                 "总更新步数": total_steps,
                                 "门控均值": f"{gate_mean:.3f}",
@@ -622,18 +688,24 @@ def train_model():
                             })
                             if writer is not None:
                                 writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                                writer.add_scalar('train/token_ce', comps_avg.get('token_ce', 0.0), total_steps)
+                                writer.add_scalar('train/gate_bce', comps_avg.get('gate_bce', 0.0), total_steps)
+                                writer.add_scalar('train/think_nce', comps_avg.get('think_nce', 0.0), total_steps)
                                 writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
                                 writer.add_scalar('train/gate_mean', gate_mean, total_steps)
                                 writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
                                 writer.add_scalar('train/cap_hit', cap_hit, total_steps)
                             if csv_writer is not None:
-                                csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
+                                csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}", f"{comps_avg.get('token_ce', 0.0):.6f}", f"{comps_avg.get('gate_bce', 0.0):.6f}", f"{comps_avg.get('think_nce', 0.0):.6f}", 'train'])
                             maybe_prune_regrow(model, total_steps)
                             if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                                 save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
                             if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
                                 val_loss = validate_model(model)
                                 print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                                # 调度器（plateau）按验证损失 step
+                                if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                    scheduler.step(val_loss)
                                 if val_loss < best_val_loss:
                                     best_val_loss = val_loss
                                     print("发现新的最佳模型！正在保存...")
@@ -657,13 +729,16 @@ def train_model():
                 )
                 pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
                 for x_ref_padded, steps_data in pbar:
-                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit = train_batch_stepwise(
+                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
                         x_ref_padded, steps_data, model, optimizer, scaler
                     )
                     total_steps += steps_in_batch
                     avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
                     pbar.set_postfix({
                         "平均步损失": f"{avg_loss:.4f}",
+                        "token_ce": f"{comps_avg.get('token_ce', 0.0):.4f}",
+                        "gate_bce": f"{comps_avg.get('gate_bce', 0.0):.4f}",
+                        "think_nce": f"{comps_avg.get('think_nce', 0.0):.4f}",
                         "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                         "总更新步数": total_steps,
                         "门控均值": f"{gate_mean:.3f}",
@@ -671,12 +746,15 @@ def train_model():
                     })
                     if writer is not None:
                         writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                        writer.add_scalar('train/token_ce', comps_avg.get('token_ce', 0.0), total_steps)
+                        writer.add_scalar('train/gate_bce', comps_avg.get('gate_bce', 0.0), total_steps)
+                        writer.add_scalar('train/think_nce', comps_avg.get('think_nce', 0.0), total_steps)
                         writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
                         writer.add_scalar('train/gate_mean', gate_mean, total_steps)
                         writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
                         writer.add_scalar('train/cap_hit', cap_hit, total_steps)
                     if csv_writer is not None:
-                        csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}"])
+                        csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}", f"{comps_avg.get('token_ce', 0.0):.6f}", f"{comps_avg.get('gate_bce', 0.0):.6f}", f"{comps_avg.get('think_nce', 0.0):.6f}", 'train'])
                     maybe_prune_regrow(model, total_steps)
                     if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                         save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)

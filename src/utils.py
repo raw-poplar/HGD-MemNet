@@ -43,83 +43,94 @@ def compute_loss(
     h_next: Optional[torch.Tensor] = None,
     think_loss_weight: float = None,
     info_nce_tau: float = None,
+    return_components: bool = False,
 ):
-    """计算单个步骤的损失（向后兼容）。
-    新增：
-      - 门控熵正则（gate_entropy_weight）
-      - 发声预算约束（target_speak_ratio）
-      - 思考信息量损失（InfoNCE，对 h_next vs h_prev）
+    """计算单个步骤的损失并可选返回分项。
+    分项包含：
+      - gate_bce: 门控 BCEWithLogitsLoss
+      - token_ce: 词预测交叉熵（首 token 或序列展平）
+      - gate_entropy_reg: 门控熵正则项（若启用）
+      - budget_reg: 发声预算约束（若配置了 target_speak_ratio）
+      - think_nce: 思考信息量损失 InfoNCE（若启用）
     """
     import torch.nn as nn
     import torch.nn.functional as F
 
-    loss = 0.0
+    # 标量分项（Tensor，便于与总损失同设备）
+    device = gate_pred.device if isinstance(gate_pred, torch.Tensor) else torch.device('cpu')
+    zero = torch.tensor(0.0, device=device)
+    gate_bce = zero
+    token_ce = zero
+    gate_entropy_reg = zero
+    budget_reg = zero
+    think_nce = zero
 
-    # 门控损失（若提供标签）
+    loss = zero.clone()
+
+    # 1) 门控损失（若提供标签）
     if gate_target is not None:
-        # 使用 BCEWithLogitsLoss：模型端不做Sigmoid，直接用logits计算
         gp_logits = gate_pred.view(-1).float()
         gt = gate_target.view(-1).to(gp_logits.dtype)
-        gate_loss = nn.BCEWithLogitsLoss()(gp_logits, gt)
-        loss = loss + gate_loss
+        gate_bce = nn.BCEWithLogitsLoss()(gp_logits, gt)
+        loss = loss + gate_bce
 
-    # 输出语言损失
+    # 2) 输出语言损失
     if target_padded is not None and output_logits is not None:
         ce = nn.CrossEntropyLoss(ignore_index=config.PAD_token)
-        # 兼容不同形状：
-        # - output_logits: (B, V) 与 target: (B) 或 (B, L)
-        # - output_logits: (B, L, V) 与 target: (B, L)
         if output_logits.dim() == 2:
-            # 模型当前每步只输出一个分布：(B, V)
             if target_padded.dim() == 2:
-                # 取每个样本目标序列的第一个非PAD词（右侧padding时第0个即可）；
-                # 若该位置为PAD，将被 ignore_index 忽略
                 labels = target_padded[:, 0]
             else:
                 labels = target_padded
-            output_loss = ce(output_logits, labels.long())
+            token_ce = ce(output_logits, labels.long())
         elif output_logits.dim() == 3:
-            # 若未来扩展为序列分布：(B, L, V)
             B, L, V = output_logits.size()
             logits_flat = output_logits.reshape(B * L, V)
             if target_padded.dim() == 2:
                 labels_flat = target_padded.reshape(B * L)
             else:
-                # 广播到每步（不常见，但做兜底）
                 labels_flat = target_padded.view(B, 1).expand(B, L).reshape(B * L)
-            output_loss = ce(logits_flat, labels_flat.long())
+            token_ce = ce(logits_flat, labels_flat.long())
         else:
-            # 其他维度不支持，安全跳过
-            output_loss = torch.tensor(0.0, device=output_logits.device, dtype=output_logits.dtype)
-        if not torch.isnan(output_loss):
-            loss = loss + output_loss
+            token_ce = zero
+        if not torch.isnan(token_ce):
+            loss = loss + token_ce
 
-    # 门控熵正则（鼓励适度不确定性/探索）
+    # 3) 门控熵正则
     ge_w = gate_entropy_weight if gate_entropy_weight is not None else getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0)
     if ge_w and ge_w > 0:
-        # 使用概率而非logits计算熵
         p = torch.sigmoid(gate_pred)
         p = torch.clamp(p, 1e-6, 1 - 1e-6)
-        entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
-        loss = loss + ge_w * entropy
+        gate_entropy_reg = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
+        loss = loss + ge_w * gate_entropy_reg
 
-    # 发声预算约束（控制平均发声比例/思考步）
+    # 4) 发声预算约束
     tsr = target_speak_ratio if target_speak_ratio is not None else getattr(config, 'TARGET_SPEAK_RATIO', None)
     if tsr is not None:
-        budget_loss = (torch.sigmoid(gate_pred).mean() - float(tsr)).abs()
-        loss = loss + 0.1 * budget_loss
+        budget_reg = (torch.sigmoid(gate_pred).mean() - float(tsr)).abs()
+        loss = loss + 0.1 * budget_reg
 
-    # 思考信息量损失（InfoNCE：拉近 h_next 与“正样本”（自身/未来），远离“负样本”（其他样本））
+    # 5) 思考信息量损失（InfoNCE）
     tlw = think_loss_weight if think_loss_weight is not None else getattr(config, 'THINK_LOSS_WEIGHT', 0.0)
     if tlw and tlw > 0 and h_prev is not None and h_next is not None:
         z_q = F.normalize(h_next, dim=-1)
-        z_k = F.normalize(h_prev.detach(), dim=-1)  # detach 防止梯度泄回前一状态
-        logits = torch.matmul(z_q, z_k.t())  # (B, B)
+        z_k = F.normalize(h_prev.detach(), dim=-1)
+        logits = torch.matmul(z_q, z_k.t())
         tau = info_nce_tau if info_nce_tau is not None else getattr(config, 'THINK_INFO_TAU', 0.1)
         logits = logits / max(tau, 1e-6)
         labels = torch.arange(logits.size(0), device=logits.device)
-        info_nce = nn.CrossEntropyLoss()(logits, labels)
-        loss = loss + tlw * info_nce
+        think_nce = nn.CrossEntropyLoss()(logits, labels)
+        loss = loss + tlw * think_nce
+
+    if return_components:
+        comps = {
+            'gate_bce': float(gate_bce.detach().item()),
+            'token_ce': float(token_ce.detach().item()) if token_ce is not None else None,
+            'gate_entropy_reg': float(gate_entropy_reg.detach().item()) if ge_w and ge_w > 0 else 0.0,
+            'budget_reg': float(budget_reg.detach().item()) if tsr is not None else 0.0,
+            'think_nce': float(think_nce.detach().item()) if (tlw and tlw > 0) else 0.0,
+        }
+        return loss, comps
 
     return loss
 
