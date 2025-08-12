@@ -16,102 +16,110 @@
 ```mermaid
 graph TB
     %% 输入层
-    subgraph "输入层 (Input Layer)"
+    subgraph "输入层 (Inputs)"
         xt["x_t<br/>(当前轮次)"]
         xref["x_ref<br/>(对话历史)"]
         hprev["h_prev<br/>(前一状态)"]
         temp["temperature<br/>(温度参数)"]
     end
 
-    %% 嵌入层
-    subgraph "嵌入层 (Embedding Layer)"
+    %% 嵌入与编码
+    subgraph "嵌入/编码 (Embedding & Encoding)"
         emb_xt["Embedding(x_t)"]
         emb_xref["Embedding(x_ref)"]
+        gru_xt["x_t 编码器<br/>(GRU: x_t_encoder)"]
+        gru_ref["历史编码器<br/>(GRU: encoder_rnn)"]
     end
 
-    %% 动态神经组
-    subgraph "动态神经组 (Dynamic Neural Group)"
+    %% 上下文构建（可配置）
+    subgraph "上下文模块 (Context)"
         direction TB
-        subgraph "编码器组"
-            gru_ref["历史编码器<br/>(GRU)"]
-            gru_xt["当前编码器<br/>(GRU)"]
-        end
-
-        subgraph "注意力机制"
-            attn["Attention<br/>(Bahdanau)"]
-        end
-
-        subgraph "核心思考单元"
-            reservoir["可训练蓄水池RNN<br/>(ReservoirRNNCell)<br/>神经元两两相连<br/>权重可学习<br/>温度控制"]
-        end
-
-        layernorm["LayerNorm<br/>(标准化)"]
+        attn["Attention<br/>(Bahdanau / Multi-Head / 关闭)"]
+        poolproj["历史平均池化 + 线性投影<br/>(无注意力时)"]
+        context["上下文向量 (context)"]
     end
 
-    %% 静态神经组
-    subgraph "静态神经组 (Static Neural Group)"
+    %% 核心思考单元 + 稀疏化
+    subgraph "动态神经组 (Dynamic Group)"
         direction TB
-        subgraph "采样策略"
-            fixed_sample["固定采样<br/>(30%固定的动态神经元)"]
-            random_sample["随机采样<br/>(5%随机的动态神经元)<br/>可学习权重"]
+        reservoir["ReservoirRNNCell<br/>• Gumbel-Softmax 连接选择<br/>• 温度 τ (可学习/外部传入)<br/>• hh_mask (稀疏拓扑)"]
+        layernorm["LayerNorm"]
+        subgraph "稀疏化机制 (Sparsify)"
+            prune["按幅值剪枝 (magnitude)"]
+            regrow["按 Hebbian×Usage 再生长"]
         end
+    end
 
-        subgraph "决策与生成"
-            gate_net["门控网络<br/>(Gate Network)<br/>决定是否输出"]
-            output_net["输出网络<br/>(Output Network)<br/>生成回应"]
-        end
+    %% 静态神经组（采样 + 决策）
+    subgraph "静态神经组 (Static Head)"
+        direction TB
+        fixed_sample["固定采样 (比例由配置)"]
+        random_sample["随机采样 (比例由配置)\n• 近似可微 Top‑k(训)/硬采样(推)\n• 上下文增强采样器(可选)"]
+        gate_net["门控网络 (是否输出)"]
+        output_net["输出网络 (分类 logits)"]
+    end
+
+    %% 可选：序列级解码
+    subgraph "可选 (Optional)"
+        seq_dec["序列级解码器<br/>(GRU + Linear)"]
+        seq_logits["seq_logits (B,L,V)"]
     end
 
     %% 输出层
-    subgraph "输出层 (Output Layer)"
-        h_next["h_next<br/>(下一状态)"]
-        gate_pred["gate_pred<br/>(门控决策)"]
-        response["output_logits<br/>(回应生成)"]
+    subgraph "输出 (Outputs)"
+        h_next["h_next (下一状态)"]
+        gate_pred["gate_pred (门控)"]
+        response["output_logits (回应)"]
     end
 
-    %% 连接关系
-    xt --> emb_xt
-    xref --> emb_xref
+    %% 流向
+    xt --> emb_xt --> gru_xt
+    xref --> emb_xref --> gru_ref
 
-    emb_xref --> gru_ref
-    emb_xt --> gru_xt
     hprev --> attn
     gru_ref --> attn
+    attn --> context
+    gru_ref --> poolproj --> context
 
-    attn --> reservoir
+    context --> reservoir
     gru_xt --> reservoir
     hprev --> reservoir
     temp --> reservoir
 
-    reservoir --> layernorm
+    prune -.-> reservoir
+    regrow -.-> reservoir
+
+    reservoir --> layernorm --> h_next
 
     layernorm --> fixed_sample
     layernorm --> random_sample
-    layernorm --> h_next
+    context --> fixed_sample
+    context --> random_sample
 
-    fixed_sample --> gate_net
+    fixed_sample --> gate_net --> gate_pred
     random_sample --> gate_net
-    attn --> gate_net
 
-    fixed_sample --> output_net
+    fixed_sample --> output_net --> response
     random_sample --> output_net
-    attn --> output_net
 
-    gate_net --> gate_pred
-    output_net --> response
+    %% 可选序列级 CE
+    emb_xt -.-> seq_dec -.-> seq_logits
 
-    %% 样式定义
+    %% 样式
     classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000
-    classDef dynamicStyle fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef encStyle fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef contextStyle fill:#ede7f6,stroke:#5e35b1,stroke-width:2px,color:#000
+    classDef coreStyle fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
     classDef staticStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
     classDef outputStyle fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px,color:#000
-    classDef coreStyle fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
 
     class xt,xref,hprev,temp inputStyle
-    class emb_xt,emb_xref,gru_ref,gru_xt,attn,layernorm dynamicStyle
-    class reservoir coreStyle
+    class emb_xt,emb_xref,gru_xt,gru_ref encStyle
+    class attn,poolproj,context contextStyle
+    class reservoir,layernorm coreStyle
+    class prune,regrow coreStyle
     class fixed_sample,random_sample,gate_net,output_net staticStyle
-    class h_next,gate_pred,response outputStyle
+    class h_next,gate_pred,response,seq_dec,seq_logits outputStyle
 ```
 
 ## 项目结构
