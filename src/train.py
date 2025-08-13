@@ -258,7 +258,7 @@ def stream_chunks(directory: str, prefetch: bool = True):  # prefetch workers从
 
 
 
-def validate_model(model):
+def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
     """验证模型：支持流式按 chunk 验证以降低内存占用。"""
     model.eval()
     val_data_path = os.path.join(config.LCCC_PROCESSED_PATH, "valid")
@@ -323,7 +323,9 @@ def validate_model(model):
                                 total_val_loss += step_loss.item()
                                 # 记录到 CSV（验证分项）：标注 split=val
                                 if csv_writer is not None:
-                                    csv_writer.writerow([epoch+1, total_steps, step_loss.item(), optimizer.param_groups[0]['lr'], '', f"{comps.get('token_ce', 0.0):.6f}", f"{comps.get('gate_bce', 0.0):.6f}", f"{comps.get('think_nce', 0.0):.6f}", 'val'])
+                                    epoch_val = (epoch + 1) if epoch is not None else ''
+                                    lr_val = optimizer.param_groups[0]['lr'] if optimizer is not None else ''
+                                    csv_writer.writerow([epoch_val, total_steps, step_loss.item(), lr_val, '', f"{comps.get('token_ce', 0.0):.6f}", f"{comps.get('gate_bce', 0.0):.6f}", f"{comps.get('think_nce', 0.0):.6f}", 'val'])
                                 h_prev = h_next
                                 total_steps += 1
                         seen_samples += len(val_dataset)
@@ -701,7 +703,7 @@ def train_model():
                             if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                                 save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
                             if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
-                                val_loss = validate_model(model)
+                                val_loss = validate_model(model, epoch=epoch, optimizer=optimizer, csv_writer=csv_writer)
                                 print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
                                 # 调度器（plateau）按验证损失 step
                                 if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -759,7 +761,7 @@ def train_model():
                     if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                         save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
                     if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
-                        val_loss = validate_model(model)
+                        val_loss = validate_model(model, epoch=epoch, optimizer=optimizer, csv_writer=csv_writer)
                         print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss

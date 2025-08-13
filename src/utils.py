@@ -79,7 +79,16 @@ def compute_loss(
         ce = nn.CrossEntropyLoss(ignore_index=config.PAD_token)
         if output_logits.dim() == 2:
             if target_padded.dim() == 2:
-                labels = target_padded[:, 0]
+                # 选择每个样本中第一个非 PAD 的目标作为监督；若整行均为 PAD，则设置为 PAD（将被 ignore）
+                nonpad_mask = (target_padded != config.PAD_token)
+                any_valid = nonpad_mask.any(dim=1)
+                # argmax 在全 False 时返回 0；我们后续会把这些样本的标签强制为 PAD
+                first_idx = nonpad_mask.float().argmax(dim=1)
+                batch_indices = torch.arange(target_padded.size(0), device=target_padded.device)
+                labels = target_padded[batch_indices, first_idx]
+                if (~any_valid).any():
+                    labels = labels.clone()
+                    labels[~any_valid] = config.PAD_token
             else:
                 labels = target_padded
             token_ce = ce(output_logits, labels.long())
