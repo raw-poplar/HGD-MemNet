@@ -123,8 +123,8 @@ THINKING_STEPS = 5
 
 
 # 新增：自适应思考步数（-1 表示不限制；训练/推理时可运行时覆盖）
-MIN_THINKING_STEPS = -1
-MAX_THINKING_STEPS = -1
+MIN_THINKING_STEPS = 5
+MAX_THINKING_STEPS = 8
 # 安全兜底，防止极端情况下长时间不发声
 SAFETY_MAX_THINKING_STEPS = 64
 
@@ -246,7 +246,7 @@ BEST_MODEL_DIR = "./best_model"
 #   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
 #   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
-GATE_THRESHOLD = 0.8
+GATE_THRESHOLD = 1.1
 
 # USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
 USE_SOFT_TOPK_TRAINING = True
@@ -265,6 +265,12 @@ GATE_ENTROPY_WEIGHT = 1e-3
 THINK_INFO_TAU = 0.1
 # 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
 CONTROL_GATE_ALPHA = 0.0
+# 控制台详细打印频率（每N个“内部总步”打印一行详细分项，0表示关闭）
+PRINT_DETAIL_EVERY_N_STEPS = 200
+# 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
+THINK_TRACE_EVERY_N_STEPS = 1000
+THINK_TRACE_TOPK = 5
+
 
 # 是否启用序列级 CE（开启后模型返回 (B, L, V) 并对每个 token 计算CE）
 USE_SEQUENCE_CE = True

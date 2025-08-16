@@ -230,7 +230,7 @@ class ReservoirRNNCell(nn.Module):
             tau_tensor = torch.as_tensor(temperature, device=h_prev.device, dtype=self.W_hh_matrix.dtype)
         else:
             tau_tensor = self.temperature
-        tau_tensor = torch.clamp(tau_tensor, min=1e-5)
+        tau_tensor = torch.clamp(tau_tensor, min=max(1e-5, getattr(config, 'CELL_MIN_TAU', 1e-3)))
 
         # 训练态强制软采样，有助于稳定反传；推理可允许硬采样
         hard = False if self.training else self.use_hard_sampling
@@ -245,12 +245,21 @@ class ReservoirRNNCell(nn.Module):
         # 3) 基于 Gumbel-Softmax 的“连接选择”权重
         gumbel_samples = F.gumbel_softmax(logits, tau=1.0, hard=hard, dim=2)
 
-        # 使用频度的 EMA 统计（仅训练态），用于后续剪枝/再生长
-        if self.training:
-            with torch.no_grad():
-                usage_batch = gumbel_samples.mean(dim=0)  # (H_out, H_in)
-                ubeta = getattr(config, 'USAGE_EMA_BETA', getattr(config, 'HEBB_EMA_BETA', 0.9))
-                self.usage_score.mul_(ubeta).add_((1.0 - ubeta) * usage_batch)
+        # 数值保护：避免 NaN/Inf
+        if torch.isnan(gumbel_samples).any() or torch.isinf(gumbel_samples).any():
+            gumbel_samples = torch.softmax(logits, dim=2)
+
+        # 监控：保存最近一次 gumbel 选择的一些统计
+        try:
+            # 每行（输出单元）的最大选择概率均值、稀疏度估计
+            row_max = gumbel_samples.max(dim=2).values.mean().detach()
+            avg_entropy = (-(gumbel_samples.clamp_min(1e-8) * gumbel_samples.clamp_min(1e-8).log()).sum(dim=2).mean()).detach()
+            self.last_selection_stats = {
+                'avg_row_max_prob': float(row_max.item()),
+                'avg_row_entropy': float(avg_entropy.item()),
+            }
+        except Exception:
+            self.last_selection_stats = None
 
         # 4) 聚合上一步隐藏状态：h_prev ∈ (B, H_in)
         if self.hidden_size > 512:
@@ -475,6 +484,9 @@ class StaticHead(nn.Module):
             nn.Linear(hidden_dim, output_dim)
         )
 
+        # 监控：最近一次采样统计（由 forward 填充）
+        self.last_sampling_stats = None
+
     def forward(self, h_from_dynamic, attn_context):
         """
         :param h_from_dynamic: 从动态组输出的完整隐藏状态 (batch_size, sampler_input_dim)
@@ -508,6 +520,20 @@ class StaticHead(nn.Module):
             topk_samples = torch.gather(random_pool, 1, topk_idx)
             # 为了与原先 concat 后的维度兼容，我们保留这 num_random 个通道（权重仅用于梯度引导）
             random_sample = topk_samples * topk_weights
+
+            # 监控：采样统计
+            try:
+                avg_topk_weight = topk_weights.mean().detach()
+                max_per_sample = topk_vals.max(dim=1).values.mean().detach()
+                # 批级覆盖率：本批 top-k 索引的全体去重比例
+                coverage = (torch.unique(topk_idx).numel() / max(1, self.random_pool_dim))
+                self.last_sampling_stats = {
+                    'avg_topk_weight': float(avg_topk_weight.item()),
+                    'avg_topk_max': float(max_per_sample.item()),
+                    'coverage_ratio': float(coverage),
+                }
+            except Exception:
+                self.last_sampling_stats = None
         else:
             # 推理时：使用多项式抽样（硬采样）
             sampling_probs = F.softmax(sampling_logits, dim=1)
@@ -515,6 +541,17 @@ class StaticHead(nn.Module):
             sampling_probs = sampling_probs / sampling_probs.sum(dim=1, keepdim=True)
             rand_indices = torch.multinomial(sampling_probs, self.num_random, replacement=False)
             random_sample = torch.gather(random_pool, 1, rand_indices)
+
+            # 监控：采样统计（推理）
+            try:
+                coverage = (torch.unique(rand_indices).numel() / max(1, self.random_pool_dim))
+                self.last_sampling_stats = {
+                    'avg_topk_weight': None,
+                    'avg_topk_max': None,
+                    'coverage_ratio': float(coverage),
+                }
+            except Exception:
+                self.last_sampling_stats = None
 
         # 3. 拼接采样结果
         sampled_state = torch.cat((fixed_sample, random_sample), dim=1)

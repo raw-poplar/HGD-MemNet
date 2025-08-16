@@ -63,9 +63,11 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     comps_acc = {
         'gate_bce': 0.0,
         'token_ce': 0.0,
+        'token_ce_eval': 0.0,
         'gate_entropy_reg': 0.0,
         'budget_reg': 0.0,
         'think_nce': 0.0,
+        'target_step_count': 0.0,  # 本 batch 内含有效标签（非PAD）的步数计数
     }
 
     h_prev = torch.zeros(batch_size, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
@@ -85,6 +87,17 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     steps_available = len(steps_data)
     # 在不改动数据管线的前提下，cap 不能超过提供的 steps；若 max_t 为 None 则使用 steps_available
     cap = min(steps_available, max_t) if max_t is not None else steps_available
+
+    # 评估用“样本级目标”（例如最终答案）：取该样本在本batch内最后一个非空 target 作为全局标签，用于在每个思考步评估 token_ce（不参与反传）
+    final_target_padded = None
+    try:
+        for s in range(steps_available - 1, -1, -1):
+            _tgt = steps_data[s][1]
+            if _tgt is not None:
+                final_target_padded = _tgt.to(DEVICE, non_blocking=True)
+                break
+    except Exception:
+        final_target_padded = None
 
     for t in range(steps_available):
         x_t_padded, target_padded, gate_target = steps_data[t]
@@ -119,6 +132,12 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
             gate_obs += 1
 
+            # 监控：温度累计（用于批平均）
+            try:
+                comps_acc['temperature'] = comps_acc.get('temperature', 0.0) + float(current_temperature)
+            except Exception:
+                pass
+
             # THINK_LOSS warmup：前 N 步内线性升温
             warmup_steps = int(getattr(config, 'THINK_WARMUP_STEPS', 0) or 0)
             tlw_cfg = float(getattr(config, 'THINK_LOSS_WEIGHT', 0.0) or 0.0)
@@ -136,10 +155,71 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                 info_nce_tau=getattr(config, 'THINK_INFO_TAU', 0.1),
                 return_components=True,
             )
+            # 统计：该步是否存在非PAD标签
+            try:
+                if target_padded is not None and target_padded.dim() == 2:
+                    nonpad_mask = (target_padded != config.PAD_token)
+                    has_valid = float(nonpad_mask.any(dim=1).float().mean().item())
+                    comps_acc['target_step_count'] += has_valid
+            except Exception:
+                pass
             # 累计分项
             try:
-                for k in comps_acc.keys():
+                for k in list(comps_acc.keys()):
                     comps_acc[k] += comps.get(k, 0.0)
+            except Exception:
+                pass
+
+            # 思考期 token_ce 评估（不参与反传）：针对没有 target_padded 的步，用最终目标评估静态头输出质量
+            try:
+                if target_padded is None and final_target_padded is not None and output_logits is not None:
+                    from .utils import compute_loss as _cl
+                    with torch.no_grad():
+                        _, eval_comps = _cl(
+                            gate_pred, None, output_logits, final_target_padded,
+                            gate_entropy_weight=0.0, target_speak_ratio=None,
+                            return_components=True,
+                        )
+                        comps_acc['token_ce_eval'] = comps_acc.get('token_ce_eval', 0.0) + eval_comps.get('token_ce', 0.0)
+            except Exception:
+                pass
+
+            # 监控：动态组核心RNN与静态头的内部统计（若可用）
+            try:
+                if hasattr(model.dynamic_group.core_rnn, 'last_selection_stats') and model.dynamic_group.core_rnn.last_selection_stats:
+                    sel = model.dynamic_group.core_rnn.last_selection_stats
+                    comps_acc['cell_avg_row_max'] = comps_acc.get('cell_avg_row_max', 0.0) + sel.get('avg_row_max_prob', 0.0)
+                    comps_acc['cell_avg_row_entropy'] = comps_acc.get('cell_avg_row_entropy', 0.0) + sel.get('avg_row_entropy', 0.0)
+                if hasattr(model.static_head, 'last_sampling_stats') and model.static_head.last_sampling_stats:
+                    samp = model.static_head.last_sampling_stats
+                    comps_acc['sampler_avg_topk_weight'] = comps_acc.get('sampler_avg_topk_weight', 0.0) + (samp.get('avg_topk_weight') or 0.0)
+                    comps_acc['sampler_avg_topk_max'] = comps_acc.get('sampler_avg_topk_max', 0.0) + (samp.get('avg_topk_max') or 0.0)
+                    comps_acc['sampler_coverage_ratio'] = comps_acc.get('sampler_coverage_ratio', 0.0) + (samp.get('coverage_ratio') or 0.0)
+            except Exception:
+                pass
+
+            # 思考过程追踪（可选）：记录静态头输出的Top-K预测（仅取第一个样本，避免日志过大）
+            try:
+                trace_every = int(getattr(config, 'THINK_TRACE_EVERY_N_STEPS', 0) or 0)
+                trace_topk = int(getattr(config, 'THINK_TRACE_TOPK', 0) or 0)
+                if trace_every > 0 and trace_topk > 0:
+                    should_trace = ((global_total_steps + steps_updated + 1) % trace_every == 0)
+                    if should_trace and output_logits is not None:
+                        if output_logits.dim() == 3:
+                            logits_for_trace = output_logits[:, -1, :]
+                        else:
+                            logits_for_trace = output_logits
+                        probs = torch.softmax(logits_for_trace, dim=-1)
+                        probs_0 = probs[0]
+                        k = min(trace_topk, probs_0.size(0))
+                        topk_vals, topk_idx = torch.topk(probs_0, k=k, dim=-1)
+                        # 写入文件
+                        os.makedirs('logs', exist_ok=True)
+                        with open(os.path.join('logs', 'thinking_trace.txt'), 'a', encoding='utf-8') as f:
+                            gp0 = float(torch.sigmoid(gate_pred[0]).item())
+                            f.write(f"step={global_total_steps+steps_updated+1}, t={t+1}, gate_p={gp0:.4f}, top{ k }: ")
+                            f.write(', '.join([f"{int(i)}:{float(v):.4f}" for i, v in zip(topk_idx.tolist(), topk_vals.tolist())]))
+                            f.write("\n")
             except Exception:
                 pass
 
@@ -681,13 +761,35 @@ def train_model():
                             pbar.set_postfix({
                                 "平均步损失": f"{avg_loss:.4f}",
                                 "token_ce": f"{comps_avg.get('token_ce', 0.0):.4f}",
+                                "token_ce_eval": f"{comps_avg.get('token_ce_eval', 0.0):.4f}",
                                 "gate_bce": f"{comps_avg.get('gate_bce', 0.0):.4f}",
                                 "think_nce": f"{comps_avg.get('think_nce', 0.0):.4f}",
+                                "有标签步占比": f"{comps_avg.get('target_step_count', 0.0):.2f}",
                                 "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                                "τ(温度)": f"{comps_avg.get('temperature', 0.0):.3f}",
+                                "cell.maxP": f"{comps_avg.get('cell_avg_row_max', 0.0):.3f}",
+                                "cell.ent": f"{comps_avg.get('cell_avg_row_entropy', 0.0):.3f}",
+                                "sam.cover": f"{comps_avg.get('sampler_coverage_ratio', 0.0):.3f}",
                                 "总更新步数": total_steps,
                                 "门控均值": f"{gate_mean:.3f}",
                                 "cap触发": cap_hit,
                             })
+                            # 可选：周期性详细打印（避免被 tqdm 覆盖）
+                            try:
+                                n = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
+                                if n > 0 and (total_steps % n == 0):
+                                    print(
+                                        f"[detail] step={total_steps} avg={avg_loss:.4f} "
+                                        f"gate_bce={comps_avg.get('gate_bce', 0.0):.4f} "
+                                        f"token_ce={comps_avg.get('token_ce', 0.0):.4f} "
+                                        f"token_ce_eval={comps_avg.get('token_ce_eval', 0.0):.4f} "
+                                        f"think_nce={comps_avg.get('think_nce', 0.0):.4f} "
+                                        f"target_ratio={comps_avg.get('target_step_count', 0.0):.2f} "
+                                        f"tau={comps_avg.get('temperature', 0.0):.3f}"
+                                    )
+                            except Exception:
+                                pass
+
                             if writer is not None:
                                 writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
                                 writer.add_scalar('train/token_ce', comps_avg.get('token_ce', 0.0), total_steps)
@@ -697,6 +799,19 @@ def train_model():
                                 writer.add_scalar('train/gate_mean', gate_mean, total_steps)
                                 writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
                                 writer.add_scalar('train/cap_hit', cap_hit, total_steps)
+                                # 新监控
+                                if 'temperature' in comps_avg:
+                                    writer.add_scalar('train/temperature', comps_avg.get('temperature', 0.0), total_steps)
+                                if 'cell_avg_row_max' in comps_avg:
+                                    writer.add_scalar('train/cell_avg_row_max', comps_avg.get('cell_avg_row_max', 0.0), total_steps)
+                                if 'cell_avg_row_entropy' in comps_avg:
+                                    writer.add_scalar('train/cell_avg_row_entropy', comps_avg.get('cell_avg_row_entropy', 0.0), total_steps)
+                                if 'sampler_avg_topk_weight' in comps_avg:
+                                    writer.add_scalar('train/sampler_avg_topk_weight', comps_avg.get('sampler_avg_topk_weight', 0.0), total_steps)
+                                if 'sampler_avg_topk_max' in comps_avg:
+                                    writer.add_scalar('train/sampler_avg_topk_max', comps_avg.get('sampler_avg_topk_max', 0.0), total_steps)
+                                if 'sampler_coverage_ratio' in comps_avg:
+                                    writer.add_scalar('train/sampler_coverage_ratio', comps_avg.get('sampler_coverage_ratio', 0.0), total_steps)
                             if csv_writer is not None:
                                 csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}", f"{comps_avg.get('token_ce', 0.0):.6f}", f"{comps_avg.get('gate_bce', 0.0):.6f}", f"{comps_avg.get('think_nce', 0.0):.6f}", 'train'])
                             maybe_prune_regrow(model, total_steps)
