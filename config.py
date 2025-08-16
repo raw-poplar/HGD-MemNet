@@ -151,7 +151,7 @@ TEMPERATURE_DECAY = 0.95
 MIN_TEMPERATURE = 0.1
 
 # 强化“思考表征”的学习（优化4）
-THINK_LOSS_WEIGHT = 0.05  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
+THINK_LOSS_WEIGHT = 0.1  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
 
 # ------------------------------------
 # 注意力机制相关参数
@@ -246,7 +246,7 @@ BEST_MODEL_DIR = "./best_model"
 #   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
 #   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
-GATE_THRESHOLD = 1.1
+GATE_THRESHOLD = 0.7
 
 # USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
 USE_SOFT_TOPK_TRAINING = True
@@ -262,13 +262,23 @@ GATE_ENTROPY_WEIGHT = 1e-3
 # 思考信息量损失（InfoNCE 等）的权重（0 表示关闭）
 # 注意：上方已设置 THINK_LOSS_WEIGHT = 0.05（优化4）
 # InfoNCE 温度
-THINK_INFO_TAU = 0.1
+THINK_INFO_TAU = 0.15
 # 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
 CONTROL_GATE_ALPHA = 0.0
 # 控制台详细打印频率（每N个“内部总步”打印一行详细分项，0表示关闭）
 PRINT_DETAIL_EVERY_N_STEPS = 200
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
+# 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
+THINK_STEP_CE_WEIGHT = 0.1
+THINK_STEP_CE_WARMUP_STEPS = 5000
+# 加权方案："t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
+THINK_STEP_CE_SCHEME = "t_norm"
+
+# 动态反馈（将阈值与上一步门控/输出摘要喂回动态组，t+1步使用）
+USE_DYNAMIC_FEEDBACK = True
+FEEDBACK_EMBED_DIM = 32  # 小投影维度，避免干扰主干
+
 THINK_TRACE_TOPK = 5
 
 

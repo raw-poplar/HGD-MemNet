@@ -123,7 +123,35 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             budget = torch.full((batch_size, 1), float(getattr(config, 'TARGET_SPEAK_RATIO', 0.0) or 0.0), device=DEVICE)
             control = torch.cat([t_norm, remain_norm, min_done, budget], dim=1)
 
-            h_next, gate_pred, output_logits = model(x_t_padded, x_ref_padded, h_prev, temperature=current_temperature, control=control)
+            # 反馈向量（上一时刻的摘要）：[threshold, gap, gate_p, top1, min_done, t_norm]
+            feedback_vec = None
+            if getattr(config, 'USE_DYNAMIC_FEEDBACK', False):
+                try:
+                    th = float(getattr(config, 'GATE_THRESHOLD', 0.5) or 0.5)
+                    gate_p = torch.sigmoid(gate_pred.detach()) if 'gate_pred' in locals() else torch.zeros(batch_size, 1, device=DEVICE)
+                    gap = gate_p - th
+                    # top1 置信度（静态头输出）
+                    if 'output_logits' in locals() and output_logits is not None:
+                        if output_logits.dim() == 3:
+                            logits_for_conf = output_logits[:, -1, :]
+                        else:
+                            logits_for_conf = output_logits
+                        probs = torch.softmax(logits_for_conf.detach(), dim=-1)
+                        top1 = probs.max(dim=-1).values.mean().view(1, 1).expand(batch_size, 1)
+                    else:
+                        top1 = torch.zeros(batch_size, 1, device=DEVICE)
+                    feedback_vec = torch.cat([
+                        torch.full((batch_size,1), th, device=DEVICE),
+                        gap, gate_p,
+                        top1,
+                        min_done, t_norm
+                    ], dim=1)
+                except Exception:
+                    feedback_vec = None
+
+            h_next, gate_pred, output_logits = model(
+                x_t_padded, x_ref_padded, h_prev, temperature=current_temperature, control=control, feedback_vec=feedback_vec
+            )
 
             # 统计门控均值/熵（gate_pred 为 logits，这里按概率统计）
             gate_prob = torch.sigmoid(gate_pred)
@@ -183,6 +211,38 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                         comps_acc['token_ce_eval'] = comps_acc.get('token_ce_eval', 0.0) + eval_comps.get('token_ce', 0.0)
             except Exception:
                 pass
+            # 思考步弱监督 token_ce（小权重+warmup+可选加权方案）
+            try:
+                w_cfg = float(getattr(config, 'THINK_STEP_CE_WEIGHT', 0.0) or 0.0)
+                if w_cfg > 0 and final_target_padded is not None and output_logits is not None and target_padded is None:
+                    # warmup 到当前步的有效权重
+                    w_steps = int(getattr(config, 'THINK_STEP_CE_WARMUP_STEPS', 0) or 0)
+                    if w_steps > 0:
+                        w_eff = w_cfg * min(1.0, (global_total_steps + steps_updated + 1) / w_steps)
+                    else:
+                        w_eff = w_cfg
+                    # 加权方案
+                    scheme = str(getattr(config, 'THINK_STEP_CE_SCHEME', 't_norm') or 't_norm').lower()
+                    if scheme == 't_norm':
+                        weight_scalar = float(((t + 1) / max(cap, 1)))
+                    elif scheme == 'gate_prob':
+                        weight_scalar = float(torch.sigmoid(gate_pred.detach()).mean().item())
+                    else:
+                        weight_scalar = 1.0
+                    # 仅取 CE 分项并加到总损失
+                    from .utils import compute_loss as _cl
+                    aux_loss, aux_comps = _cl(
+                        gate_pred=None, gate_target=None,
+                        output_logits=output_logits, target_padded=final_target_padded,
+                        gate_entropy_weight=0.0, target_speak_ratio=None,
+                        return_components=True,
+                    )
+                    token_ce_aux = aux_comps.get('token_ce', 0.0) if isinstance(aux_comps, dict) else 0.0
+                    step_loss = step_loss + w_eff * weight_scalar * (aux_loss if aux_loss is not None else 0.0)
+                    comps_acc['token_ce'] = comps_acc.get('token_ce', 0.0) + (w_eff * weight_scalar * token_ce_aux)
+            except Exception:
+                pass
+
 
             # 监控：动态组核心RNN与静态头的内部统计（若可用）
             try:
@@ -605,11 +665,41 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
 
     latest_checkpoint_path = max(checkpoints, key=os.path.getmtime)
     print(f"正在从最新的检查点加载: {latest_checkpoint_path}")
-    # 显式指定 weights_only=False（我们需要优化器/Scaler等对象）；未来可改为安全加载仅权重
+    # 显式指定 weights_only=False（我们需要优化器/Scaler等对象）
     checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE, weights_only=False)
 
-    # 允许部分加载（序列CE等新模块在旧权重中缺失）
-    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    # 安全部分加载：仅加载与当前模型形状一致的权重，忽略形状不匹配的层
+    try:
+        ckpt_state = checkpoint.get('model_state_dict', {})
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped = []
+        for k, v in ckpt_state.items():
+            if k in model_state and hasattr(v, 'shape') and hasattr(model_state[k], 'shape'):
+                if v.shape == model_state[k].shape:
+                    filtered_state[k] = v
+                else:
+                    skipped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            else:
+                # 若不存在或不是张量（如缓冲区），尝试保留
+                if k in model_state:
+                    try:
+                        filtered_state[k] = v
+                    except Exception:
+                        skipped.append((k, 'NA', 'NA'))
+        incompatible = model.load_state_dict(filtered_state, strict=False)
+        if skipped:
+            print(f"提示：跳过 {len(skipped)} 个形状不匹配的层（例如 {skipped[0][0]}: {skipped[0][1]} -> {skipped[0][2]}）。")
+        # 可选打印 missing/unexpected
+        try:
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                print(f"提示：部分权重未匹配。missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"警告：加载模型权重时发生异常，尝试忽略不兼容层：{e}")
+
+    # 优化器与 Scaler
     try:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         # 将优化器状态迁移到当前设备
@@ -628,10 +718,9 @@ def load_latest_checkpoint(model, optimizer, scaler, directory):
     start_epoch = checkpoint.get('epoch', 0)
     total_steps = checkpoint.get('total_steps', 0)
 
-    # 打印部分加载信息
+    # 打印部分加载信息（已在上方以 incompatible 对象形式显示）
     try:
-        if missing or unexpected:
-            print(f"提示：部分权重未匹配。missing={len(missing)} unexpected={len(unexpected)}")
+        _ = incompatible  # 仅为避免未使用警告
     except Exception:
         pass
 

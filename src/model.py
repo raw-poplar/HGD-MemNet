@@ -375,12 +375,22 @@ class DynamicGroup(nn.Module):
             self.history_projector = nn.Linear(hidden_dim, hidden_dim)
             core_input_size = hidden_dim + hidden_dim  # x_t_encoded + history_context
 
+        # 动态反馈投影（可选）
+        self.use_feedback = getattr(config, 'USE_DYNAMIC_FEEDBACK', False)
+        if self.use_feedback:
+            self.feedback_proj = nn.Sequential(
+                nn.Linear(6, getattr(config, 'FEEDBACK_EMBED_DIM', 32)),  # 预留6维反馈: [th, gap, gate_p, top1, min_done, t_norm]
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            core_input_size += getattr(config, 'FEEDBACK_EMBED_DIM', 32)
+
         # 核心演化RNN: 被替换为新的可训练“蓄水池”单元
         self.core_rnn = ReservoirRNNCell(core_input_size, hidden_dim)
 
         self.norm = nn.LayerNorm(hidden_dim)  # 新增：LayerNorm for RNN输出
 
-    def forward(self, x_t, x_ref_encoded, h_prev, temperature=None, x_ref_mask=None):
+    def forward(self, x_t, x_ref_encoded, h_prev, temperature=None, x_ref_mask=None, feedback_vec=None):
         """
         Args:
             x_t (torch.Tensor): 当前时间步的输入, shape: (batch_size, seq_len, embed_dim)
@@ -416,8 +426,23 @@ class DynamicGroup(nn.Module):
                 history_pooled = torch.mean(x_ref_encoded, dim=1)  # (batch_size, hidden_dim)
             context = self.history_projector(history_pooled)  # (batch_size, hidden_dim)
 
-        # 2. 将上下文向量和当前输入拼接
+        # 2. 将上下文向量和当前输入拼接（可选拼入反馈）
         rnn_input = torch.cat((x_t_encoded, context), dim=1)  # (batch, hidden + hidden)
+        if self.use_feedback:
+            try:
+                if feedback_vec is not None:
+                    fb = feedback_vec.detach() if isinstance(feedback_vec, torch.Tensor) else torch.as_tensor(feedback_vec, device=h_prev.device, dtype=x_t_encoded.dtype)
+                    if fb.dim() == 1:
+                        fb = fb.unsqueeze(0).expand(x_t_encoded.size(0), -1)
+                    fb_emb = self.feedback_proj(fb)
+                else:
+                    # 无反馈时拼接零嵌入，保证维度一致
+                    fb_emb_dim = getattr(config, 'FEEDBACK_EMBED_DIM', 32)
+                    fb_emb = torch.zeros(x_t_encoded.size(0), fb_emb_dim, device=h_prev.device, dtype=x_t_encoded.dtype)
+                rnn_input = torch.cat([rnn_input, fb_emb], dim=1)
+            except Exception:
+                # 出错则退化为不使用反馈
+                pass
 
         # 3. 将拼接后的向量输入到核心RNN
         # h_prev shape: (batch_size, hidden_dim) for our cell
@@ -612,7 +637,7 @@ class HGD_MemNet(nn.Module):
             self.seq_decoder = nn.GRU(embed_dim, dynamic_hidden_dim, batch_first=True)
             self.seq_out = nn.Linear(dynamic_hidden_dim, vocab_size)
 
-    def forward(self, x_t, x_ref, h_prev, temperature=None, control=None):
+    def forward(self, x_t, x_ref, h_prev, temperature=None, control=None, feedback_vec=None):
         """
         一次完整的思考步骤
 
@@ -622,6 +647,7 @@ class HGD_MemNet(nn.Module):
             h_prev (torch.Tensor): 上一步的隐藏状态, shape: (batch, dynamic_hidden_dim)
             temperature (float, optional): 温度参数，传递给动态组的核心RNN
             control (torch.Tensor, optional): (batch, C) 控制向量，如 [t_norm, remain_norm, min_done, target_speak_ratio]
+            feedback_vec (torch.Tensor, optional): (batch, 6) 动态反馈（阈值与上一步门控/输出摘要），仅用于下一步演化
 
         Returns:
             h_next (torch.Tensor): 下一步的隐藏状态
@@ -640,9 +666,10 @@ class HGD_MemNet(nn.Module):
         # encoder_outputs shape: (batch_size, ref_seq_len, dynamic_hidden_dim)
         encoder_outputs, _ = self.dynamic_group.encoder_rnn(x_ref_embedded)
 
-        # 3. 通过动态组进行一步演化
-        # 传入编码后的x_ref作为key, 获得下一步的隐藏状态和该步的注意力上下文
-        h_next, attn_context = self.dynamic_group(x_t_embedded, encoder_outputs, h_prev, temperature, x_ref_mask=x_ref_mask)
+        # 3. 通过动态组进行一步演化（可选传入反馈）
+        h_next, attn_context = self.dynamic_group(
+            x_t_embedded, encoder_outputs, h_prev, temperature, x_ref_mask=x_ref_mask, feedback_vec=feedback_vec
+        )
 
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)
