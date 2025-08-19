@@ -57,7 +57,13 @@ def compute_loss(
     import torch.nn.functional as F
 
     # 标量分项（Tensor，便于与总损失同设备）
-    device = gate_pred.device if isinstance(gate_pred, torch.Tensor) else torch.device('cpu')
+    # 设备推断：优先 gate_pred，其次 output_logits，最后 CPU（避免 None 时发生跨设备相加错误）
+    if isinstance(gate_pred, torch.Tensor):
+        device = gate_pred.device
+    elif isinstance(output_logits, torch.Tensor):
+        device = output_logits.device
+    else:
+        device = torch.device('cpu')
     zero = torch.tensor(0.0, device=device)
     gate_bce = zero
     token_ce = zero
@@ -71,7 +77,16 @@ def compute_loss(
     if gate_target is not None:
         gp_logits = gate_pred.view(-1).float()
         gt = gate_target.view(-1).to(gp_logits.dtype)
-        gate_bce = nn.BCEWithLogitsLoss()(gp_logits, gt)
+        # 处理类别不均衡：正样本（发声）通常远少于负样本（思考）
+        pos_w_cfg = getattr(config, 'GATE_POS_WEIGHT', None)
+        if pos_w_cfg is not None:
+            try:
+                criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_w_cfg), device=gp_logits.device, dtype=gp_logits.dtype))
+            except Exception:
+                criterion = nn.BCEWithLogitsLoss()
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+        gate_bce = criterion(gp_logits, gt)
         loss = loss + gate_bce
 
     # 2) 输出语言损失
@@ -94,12 +109,46 @@ def compute_loss(
             token_ce = ce(output_logits, labels.long())
         elif output_logits.dim() == 3:
             B, L, V = output_logits.size()
-            logits_flat = output_logits.reshape(B * L, V)
+            # 对齐序列长度，防止 logits 长度与标签长度不一致
             if target_padded.dim() == 2:
-                labels_flat = target_padded.reshape(B * L)
+                L_t = target_padded.size(1)
+                L_eff = min(L, L_t)
+                logits_eff = output_logits[:, :L_eff, :]
+                labels_eff = target_padded[:, :L_eff]
+                logits_flat = logits_eff.reshape(B * L_eff, V)
+                labels_flat = labels_eff.reshape(B * L_eff)
             else:
-                labels_flat = target_padded.view(B, 1).expand(B, L).reshape(B * L)
+                # 单标签广播到时间维（保持与 logits 的时间维一致）
+                L_eff = L
+                logits_flat = output_logits.reshape(B * L_eff, V)
+                labels_flat = target_padded.view(B, 1).expand(B, L_eff).reshape(B * L_eff)
             token_ce = ce(logits_flat, labels_flat.long())
+
+            # 调试：详细打印 CE 计算过程 + 简易准确率/标签概率
+            if getattr(config, 'DEBUG_TOKEN_CE', False):
+                try:
+                    pad_token = getattr(config, 'PAD_token', 0)
+                    valid_mask = (labels_flat != pad_token)
+                    valid_count = int(valid_mask.sum().item())
+                    unique_labels = torch.unique(labels_flat).tolist()
+                    print(f"[debug/ce_detail] labels_flat_shape={labels_flat.shape} valid_count={valid_count} unique_labels={unique_labels[:10]} token_ce={float(token_ce.item()):.6f}")
+                    if valid_count > 0:
+                        # 检查有效标签的范围
+                        valid_labels = labels_flat[valid_mask]
+                        min_label, max_label = int(valid_labels.min().item()), int(valid_labels.max().item())
+                        vocab_size = logits_flat.size(-1)
+                        print(f"[debug/ce_detail] valid_label_range=[{min_label}, {max_label}] vocab_size={vocab_size} out_of_range={max_label >= vocab_size}")
+                        # 简易准确率
+                        with torch.no_grad():
+                            preds = torch.argmax(logits_flat[valid_mask], dim=-1)
+                            acc = float((preds == valid_labels).float().mean().item())
+                            # 标签概率
+                            log_probs = torch.log_softmax(logits_flat[valid_mask], dim=-1)
+                            true_logp = log_probs[torch.arange(valid_labels.size(0), device=log_probs.device), valid_labels]
+                            true_p = torch.exp(true_logp).mean().item()
+                            print(f"[debug/ce_acc] acc={acc:.4f} true_p_mean={true_p:.4f}")
+                except Exception as e:
+                    print(f"[debug/ce_detail] error: {e}")
         else:
             token_ce = zero
         if not torch.isnan(token_ce):

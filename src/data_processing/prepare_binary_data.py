@@ -24,12 +24,72 @@ def print(*args, **kwargs):
     return _print(*[_strip(a) for a in args], **kwargs)
 
 # --- 辅助函数 ---
+def preprocess_text_for_indexing(text):
+    """
+    与词表构建一致的文本预处理（简化版）
+    返回词汇列表，用于索引映射
+    """
+    if not text or not isinstance(text, str):
+        return []
+
+    import unicodedata
+    import re
+
+    # 基础清理与归一化
+    text = unicodedata.normalize('NFKC', text).strip()
+    if not text:
+        return []
+
+    # 去除 URL/邮箱/emoji（与词表构建保持一致）
+    url_pattern = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+    email_pattern = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+    emoji_pattern = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF\U00002190-\U00002BFF]")
+
+    text = url_pattern.sub(' ', text)
+    text = email_pattern.sub(' ', text)
+    text = emoji_pattern.sub('', text)
+
+    # 英文小写化
+    text = text.lower()
+
+    # 分词（优先使用 jieba，不可用时回退）
+    try:
+        import jieba
+        words = jieba.lcut(text)
+    except Exception:
+        # 退化：按空白切分 + 保留中文连续块
+        parts = re.split(r"\s+", text)
+        words = []
+        for p in parts:
+            words.extend(re.findall(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+", p))
+
+    # 过滤与清理（与词表构建保持一致）
+    chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
+    cleaned_words = []
+    for word in words:
+        word = word.strip()
+        if not word:
+            continue
+        if chinese_pattern.search(word) or word.isalpha():
+            cleaned_words.append(word)
+        elif word.isdigit():
+            if len(word) <= 4:
+                cleaned_words.append(word)
+            else:
+                cleaned_words.append('<NUM>')
+
+    return cleaned_words
+
 def indexesFromSentence(vocab, sentence):
-    """将句子转换为索引列表"""
+    """将句子转换为索引列表（使用与词表一致的分词）"""
     if sentence is None:
         return []
+
+    # 使用与词表构建一致的预处理
+    words = preprocess_text_for_indexing(sentence)
+
     UNK_idx = vocab.word2index.get("<UNK>", config.UNK_token)
-    return [vocab.word2index.get(word, UNK_idx) for word in sentence.split(' ')] + [config.EOS_token]
+    return [vocab.word2index.get(word, UNK_idx) for word in words] + [config.EOS_token]
 
 # 全局变量，用于多进程
 _global_vocab = None

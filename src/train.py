@@ -93,12 +93,22 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     try:
         for s in range(steps_available - 1, -1, -1):
             _tgt = steps_data[s][1]
-            if _tgt is not None:
-                final_target_padded = _tgt.to(DEVICE, non_blocking=True)
-                break
+            # 仅当 target 存在且包含至少一个非 PAD token 时，才作为最终目标
+            if _tgt is not None and _tgt.numel() > 0:
+                # 若为 2D，检查是否存在非PAD元素
+                if _tgt.dim() == 2:
+                    if (_tgt != config.PAD_token).any():
+                        final_target_padded = _tgt.to(DEVICE, non_blocking=True)
+                        break
+                else:
+                    final_target_padded = _tgt.to(DEVICE, non_blocking=True)
+                    break
     except Exception:
         final_target_padded = None
 
+    # 梯度累积设置（在样本的“内部思考步”维度累积）
+    acc_steps = max(1, int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1))
+    optimizer.zero_grad()
     for t in range(steps_available):
         x_t_padded, target_padded, gate_target = steps_data[t]
         x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
@@ -113,7 +123,8 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
         # 新增：计算当前步骤的温度
         current_temperature = max(initial_temperature * (temperature_decay ** t), config.MIN_TEMPERATURE)
 
-        optimizer.zero_grad()
+        # 累积中不要在每个时间步 zero_grad（外部已 zero），只在 step 时机再清零
+        # optimizer.zero_grad()
 
         with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
             # 构造控制向量（时机意识）：t_norm, remain_norm, min_done, target_speak_ratio
@@ -198,6 +209,40 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             except Exception:
                 pass
 
+            # --- 调试：token_ce 相关诊断打印（按需开启） ---
+            try:
+                if getattr(config, 'DEBUG_TOKEN_CE', False):
+                    dbg_every = int(getattr(config, 'DEBUG_TOKEN_CE_EVERY_N', 1000) or 1000)
+                    dbg_step = global_total_steps + steps_updated + 1
+                    if dbg_every > 0 and (dbg_step % dbg_every == 0):
+                        lines = [
+                            f"[debug/token_ce] step={dbg_step} t={t+1} use_seq_ce={getattr(config, 'USE_SEQUENCE_CE', False)}"
+                        ]
+                        if target_padded is None:
+                            lines.append(" target=None (thinking step)")
+                            if final_target_padded is not None:
+                                nonpad_final = int((final_target_padded != config.PAD_token).sum().item())
+                                lines.append(f" final_target_shape={tuple(final_target_padded.shape)} final_nonpad={nonpad_final}")
+                        else:
+                            nonpad = int((target_padded != config.PAD_token).sum().item())
+                            lines.append(f" target_shape={tuple(target_padded.shape)} nonpad={nonpad}")
+                        if output_logits is None:
+                            lines.append(" logits=None")
+                        else:
+                            shp = tuple(output_logits.shape)
+                            lines.append(f" logits_shape={shp} dim={output_logits.dim()}")
+                            if output_logits.dim() == 3 and target_padded is not None and target_padded.dim() == 2:
+                                L = output_logits.size(1); L_t = target_padded.size(1); L_eff = min(L, L_t)
+                                lines.append(f" L={L} L_t={L_t} L_eff={L_eff}")
+                        try:
+                            lines.append(f" comps.token_ce={comps.get('token_ce', None)}")
+                        except Exception:
+                            pass
+                        print("\n".join(lines))
+            except Exception:
+                pass
+            # --- 调试结束 ---
+
             # 思考期 token_ce 评估（不参与反传）：针对没有 target_padded 的步，用最终目标评估静态头输出质量
             try:
                 if target_padded is None and final_target_padded is not None and output_logits is not None:
@@ -213,6 +258,20 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                 pass
             # 思考步弱监督 token_ce（小权重+warmup+可选加权方案）
             try:
+                # 辅助 CE 触发检查（仅调试）
+                try:
+                    if getattr(config, 'DEBUG_TOKEN_CE', False):
+                        w_cfg_dbg = float(getattr(config, 'THINK_STEP_CE_WEIGHT', 0.0) or 0.0)
+                        cond = {
+                            'w_cfg>0': (w_cfg_dbg > 0),
+                            'is_thinking_step': (target_padded is None),
+                            'has_final_target': (final_target_padded is not None and (final_target_padded != config.PAD_token).any().item() if final_target_padded is not None else False),
+                            'has_logits': (output_logits is not None),
+                        }
+                        print(f"[debug/aux_check] step={global_total_steps+steps_updated+1} t={t+1} {cond}")
+                except Exception:
+                    pass
+
                 w_cfg = float(getattr(config, 'THINK_STEP_CE_WEIGHT', 0.0) or 0.0)
                 if w_cfg > 0 and final_target_padded is not None and output_logits is not None and target_padded is None:
                     # warmup 到当前步的有效权重
@@ -238,8 +297,16 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                         return_components=True,
                     )
                     token_ce_aux = aux_comps.get('token_ce', 0.0) if isinstance(aux_comps, dict) else 0.0
-                    step_loss = step_loss + w_eff * weight_scalar * (aux_loss if aux_loss is not None else 0.0)
-                    comps_acc['token_ce'] = comps_acc.get('token_ce', 0.0) + (w_eff * weight_scalar * token_ce_aux)
+                    add_val = w_eff * weight_scalar * token_ce_aux
+                    step_loss = step_loss + (w_eff * weight_scalar * (aux_loss if aux_loss is not None else 0.0))
+                    comps_acc['token_ce'] = comps_acc.get('token_ce', 0.0) + add_val
+                    # 调试输出：辅助 token_ce 是否被触发及其数值
+                    if getattr(config, 'DEBUG_TOKEN_CE', False):
+                        try:
+                            nonpad_final = int((final_target_padded != config.PAD_token).sum().item()) if final_target_padded is not None else -1
+                            print(f"[debug/token_aux] step={global_total_steps+steps_updated+1} t={t+1} w_eff={w_eff:.4f} scheme={scheme} w_scalar={weight_scalar:.4f} ce_aux={float(token_ce_aux):.6f} add={float(add_val):.6f} final_nonpad={nonpad_final}")
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -283,26 +350,30 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             except Exception:
                 pass
 
-        scaler.scale(step_loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        # 梯度累积：对损失做平均再反传
+        scaled_loss = step_loss / acc_steps
+        scaler.scale(scaled_loss).backward()
+
+        # 满足累积步数或到步尾时再执行优化器更新
+        if ((t + 1) % acc_steps == 0):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
         total_batch_loss += step_loss.item()
         h_prev = h_next.detach()
         steps_updated += 1
 
         # 基于门控的多步思考早停（需达到最小思考步才生效）
-        if getattr(config, 'USE_GATED_MULTISTEP', False):
-            reached_min = (min_t is None) or ((t + 1) >= min_t)
-            if reached_min and (gate_pred.mean().item() >= config.GATE_THRESHOLD):
-                break
-
-        # 达到最大思考步上限（cap）则强制停止本样本的内部思考
-        if (t + 1) >= cap:
-            ended_by_cap = True
-            break
+    # 循环结束后，如仍有未更新的累积梯度则执行一次优化器更新
+    if (steps_updated % acc_steps) != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
 
     for i, param_group in enumerate(optimizer.param_groups):
         param_group['lr'] = original_lrs[i]
@@ -440,6 +511,7 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
                             collate_fn=binary_collate_fn,
                             num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
                             shuffle=False,
+                            pin_memory=torch.cuda.is_available(),
                         )
                         pbar = tqdm(val_loader, desc=f"正在验证 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
@@ -560,6 +632,7 @@ def test_model(model):
                             collate_fn=binary_collate_fn,
                             num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
                             shuffle=False,
+                            pin_memory=torch.cuda.is_available(),
                         )
                         pbar = tqdm(test_loader, desc=f"正在测试 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
@@ -765,11 +838,26 @@ def train_model():
 
         print("注意：由于动态学习率调整，模型JIT脚本化已被禁用。")
 
-        # 优化器（优化2）：AdamW 默认 + Adam 兼容
+        # 优化器（优化2）：AdamW 默认 + Adam 兼容 + no_decay 参数分组
+        decay_params, no_decay_params = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_bias = n.endswith('.bias')
+            is_norm = ('norm' in n.lower()) or ('layernorm' in n.lower()) or ('.bn' in n.lower())
+            is_embed = ('embed' in n.lower()) or ('embedding' in n.lower())
+            if (p.ndim >= 2) and (not is_bias) and (not is_norm) and (not is_embed):
+                decay_params.append(p)
+            else:
+                no_decay_params.append(p)
+        param_groups = [
+            {'params': decay_params, 'weight_decay': getattr(config, 'WEIGHT_DECAY', 1e-2)},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ]
         if getattr(config, 'OPTIMIZER', 'adam').lower() == 'adamw':
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-2))
+            optimizer = torch.optim.AdamW(param_groups, lr=config.LEARNING_RATE)
         else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=getattr(config, 'WEIGHT_DECAY', 1e-5))
+            optimizer = torch.optim.Adam(param_groups, lr=config.LEARNING_RATE)
         scaler = GradScaler(enabled=torch.cuda.is_available())
 
         start_epoch, total_steps = load_latest_checkpoint(model, optimizer, scaler, config.CHECKPOINT_DIR)
@@ -839,6 +927,7 @@ def train_model():
                             collate_fn=binary_collate_fn,
                             num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
                             shuffle=True,
+                            pin_memory=torch.cuda.is_available(),
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
@@ -973,7 +1062,8 @@ def train_model():
                             logging.info(f"新最佳验证损失: {val_loss}")
                             save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR, is_best=True)
 
-            scheduler.step()  # 每轮更新学习率
+            if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.StepLR):
+                scheduler.step()  # 仅 StepLR 在每轮末 step；ReduceLROnPlateau 已在验证时 step(val_loss)
             # 轮次汇总日志
             try:
                 print(f"\n[汇总] 轮次 {epoch+1}/{config.NUM_EPOCHS} 完成 | 最佳验证损失: {best_val_loss:.4f} | 总更新步: {total_steps} | 当前学习率: {optimizer.param_groups[0]['lr']:.6f}")

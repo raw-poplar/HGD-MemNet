@@ -130,7 +130,7 @@ SAFETY_MAX_THINKING_STEPS = 64
 
 # 优化器/调度（优化2）：AdamW + ReduceLROnPlateau
 OPTIMIZER = "adamw"          # "adam" / "adamw"
-LEARNING_RATE = 3e-4          # 由 1e-3 调低，更稳
+LEARNING_RATE = 2e-4          # 由 1e-3 调低，更稳
 WEIGHT_DECAY = 1e-2           # AdamW 默认较大的权重衰减
 LR_SCHEDULER = "plateau"     # "none" / "step" / "plateau"
 LR_DECAY_RATE = 0.95          # 仅 step 有效
@@ -148,7 +148,7 @@ INNER_STEP_LR_DECAY = 0.95
 #   - MIN_TEMPERATURE: 最小温度下限，防止完全确定性导致停滞。
 INITIAL_TEMPERATURE = 1.5
 TEMPERATURE_DECAY = 0.95
-MIN_TEMPERATURE = 0.1
+MIN_TEMPERATURE = 0.2
 
 # 强化“思考表征”的学习（优化4）
 THINK_LOSS_WEIGHT = 0.1  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
@@ -216,6 +216,10 @@ USE_CSV_LOGGER = True
 CSV_LOG_PATH = "./logs/train_metrics.csv"
 # CSV 列扩展（分项指标）将自动写入：token_ce、gate_bce、think_nce
 
+# 调试开关：打印 token_ce 相关诊断（默认关闭，避免刷屏）
+DEBUG_TOKEN_CE = True
+DEBUG_TOKEN_CE_EVERY_N = 1000  # 每多少总步打印一次 debug（建议 >=1000）
+
 # THINK_LOSS warmup 步数（0 表示关闭）。建议设为若干验证间隔的总步数，如 5*VALIDATE_EVERY_N_STEPS
 # 注意：需在 VALIDATE_EVERY_N_STEPS 定义之后设置；此处仅占位，真正值在下方定义
 THINK_WARMUP_STEPS = None
@@ -259,6 +263,8 @@ USE_CONTEXTUAL_SAMPLER = True
 TARGET_SPEAK_RATIO = 0.2
 # 门控熵正则权重（鼓励适度不确定性，防止塌缩）
 GATE_ENTROPY_WEIGHT = 1e-3
+# 门控BCE的正样本权重（处理类别不均衡：思考步多gate=0，发声步少gate=1）
+GATE_POS_WEIGHT = 1.2
 # 思考信息量损失（InfoNCE 等）的权重（0 表示关闭）
 # 注意：上方已设置 THINK_LOSS_WEIGHT = 0.05（优化4）
 # InfoNCE 温度
@@ -270,10 +276,10 @@ PRINT_DETAIL_EVERY_N_STEPS = 200
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
 # 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
-THINK_STEP_CE_WEIGHT = 0.1
-THINK_STEP_CE_WARMUP_STEPS = 5000
+THINK_STEP_CE_WEIGHT = 0.5
+THINK_STEP_CE_WARMUP_STEPS = 0
 # 加权方案："t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
-THINK_STEP_CE_SCHEME = "t_norm"
+THINK_STEP_CE_SCHEME = "gate_prob"
 
 # 动态反馈（将阈值与上一步门控/输出摘要喂回动态组，t+1步使用）
 USE_DYNAMIC_FEEDBACK = True
