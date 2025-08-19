@@ -426,6 +426,41 @@ def maybe_prune_regrow(model, total_steps):
     except Exception as e:
         logging.warning(f"剪枝/再生长触发失败: {e}")
 
+# ========= Live 内存流式：直接从 jsonl 生成内存 chunk =========
+from typing import Iterable
+
+def stream_live_jsonl(file_path: str, vocab, chunk_size: int = 1000, start_line: int = 0) -> Iterable[tuple[str, list, int]]:
+    """逐行读取 jsonl，在线处理为 (x_ref, steps_data) 并按 chunk_size 产出内存块。
+    - start_line: 断点续读的起始行号（0-based），用于从上次位置继续。
+    返回: (chunk_name, data_list, end_line)，end_line 为本次产出后应记录的续读起点。
+    仅在 ENABLE_LIVE_STREAM_TRAIN 且 LIVE_STREAM_MODE=="memory" 时使用。
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"未找到 jsonl 文件: {file_path}")
+    from src.data_processing.prepare_binary_data import process_dialogue_to_tensors
+    buf = []
+    idx = 0
+    end_line = start_line
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for ln, line in enumerate(f):
+            if ln < max(0, int(start_line)):
+                continue
+            try:
+                dialogue = json.loads(line)
+                item = process_dialogue_to_tensors(dialogue, vocab)
+                if item:
+                    buf.append(item)
+                end_line = ln + 1  # 下次从该行开始
+                if len(buf) >= max(1, int(chunk_size)):
+                    yield f"live_chunk_{idx}", buf, end_line
+                    buf = []
+                    idx += 1
+            except Exception:
+                # 跳过异常行
+                continue
+    if buf:
+        yield f"live_chunk_{idx}", buf, end_line
+
 # ========= Chunk 流式加载工具 =========
 from typing import List
 
@@ -915,8 +950,123 @@ def train_model():
                 csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean', 'token_ce', 'gate_bce', 'think_nce', 'split'])
 
         for epoch in range(start_epoch, config.NUM_EPOCHS):
-            if getattr(config, 'USE_STREAMING_TRAIN', True):
-                # ========= 流式训练：逐块加载与训练 =========
+            if getattr(config, 'ENABLE_LIVE_STREAM_TRAIN', False) and getattr(config, 'LIVE_STREAM_MODE', 'memory') == 'memory':
+                # ========= 在线内存流式训练：逐行处理 jsonl 并按内存 chunk 训练 =========
+                print("启用在线内存流式训练（内存队列 / 按行处理 jsonl）")
+                # 读取进度
+                progress_path = os.path.join(getattr(config, 'CHECKPOINT_DIR', './checkpoints'), 'train_progress.json')
+                start_line = 0
+                try:
+                    if os.path.exists(progress_path):
+                        with open(progress_path, 'r', encoding='utf-8') as pf:
+                            prog = json.load(pf)
+                            start_line = int(prog.get('live_start_line', 0) or 0)
+                except Exception:
+                    start_line = 0
+                print(f"从 jsonl 第 {start_line} 行开始流式训练…")
+
+                for chunk_name, chunk_data, end_line in stream_live_jsonl(
+                    getattr(config, 'LCCC_TRAIN_FILE', ''), vocab,
+                    chunk_size=getattr(config, 'LIVE_STREAM_CHUNK_SIZE', 1000),
+                    start_line=start_line,
+                ):
+                    try:
+                        train_dataset = _ChunkListDataset(chunk_data)
+                        train_loader = DataLoader(
+                            train_dataset,
+                            batch_size=config.BATCH_SIZE,
+                            collate_fn=binary_collate_fn,
+                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            shuffle=True,
+                            pin_memory=torch.cuda.is_available(),
+                        )
+                        pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
+                        for x_ref_padded, steps_data in pbar:
+                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
+                                x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                            )
+                            total_steps += steps_in_batch
+                            avg_loss = batch_loss / max(1, steps_in_batch)
+                            pbar.set_postfix({
+                                "平均步损失": f"{avg_loss:.4f}",
+                                "token_ce": f"{comps_avg.get('token_ce', 0.0):.4f}",
+                                "token_ce_eval": f"{comps_avg.get('token_ce_eval', 0.0):.4f}",
+                                "gate_bce": f"{comps_avg.get('gate_bce', 0.0):.4f}",
+                                "think_nce": f"{comps_avg.get('think_nce', 0.0):.4f}",
+                                "有标签步占比": f"{comps_avg.get('target_step_count', 0.0):.2f}",
+                                "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                                "τ(温度)": f"{comps_avg.get('temperature', 0.0):.3f}",
+                                "cell.maxP": f"{comps_avg.get('cell_avg_row_max', 0.0):.3f}",
+                                "cell.ent": f"{comps_avg.get('cell_avg_row_entropy', 0.0):.3f}",
+                                "sam.cover": f"{comps_avg.get('sampler_coverage_ratio', 0.0):.3f}",
+                                "总更新步数": total_steps,
+                                "门控均值": f"{gate_mean:.3f}",
+                                "cap触发": cap_hit,
+                            })
+                            # 可选：周期性详细打印
+                            try:
+                                n = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
+                                if n > 0 and (total_steps % n == 0):
+                                    print(
+                                        f"[detail] step={total_steps} avg={avg_loss:.4f} "
+                                        f"gate_bce={comps_avg.get('gate_bce', 0.0):.4f} "
+                                        f"token_ce={comps_avg.get('token_ce', 0.0):.4f} "
+                                        f"token_ce_eval={comps_avg.get('token_ce_eval', 0.0):.4f} "
+                                        f"think_nce={comps_avg.get('think_nce', 0.0):.4f} "
+                                        f"target_ratio={comps_avg.get('target_step_count', 0.0):.2f} "
+                                        f"tau={comps_avg.get('temperature', 0.0):.3f}"
+                                    )
+                            except Exception:
+                                pass
+
+                            if writer is not None:
+                                writer.add_scalar('train/avg_step_loss', avg_loss, total_steps)
+                                writer.add_scalar('train/token_ce', comps_avg.get('token_ce', 0.0), total_steps)
+                                writer.add_scalar('train/gate_bce', comps_avg.get('gate_bce', 0.0), total_steps)
+                                writer.add_scalar('train/think_nce', comps_avg.get('think_nce', 0.0), total_steps)
+                                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], total_steps)
+                                writer.add_scalar('train/gate_mean', gate_mean, total_steps)
+                                writer.add_scalar('train/gate_entropy', gate_entropy, total_steps)
+                                writer.add_scalar('train/cap_hit', cap_hit, total_steps)
+                                if 'temperature' in comps_avg:
+                                    writer.add_scalar('train/temperature', comps_avg.get('temperature', 0.0), total_steps)
+                                if 'cell_avg_row_max' in comps_avg:
+                                    writer.add_scalar('train/cell_avg_row_max', comps_avg.get('cell_avg_row_max', 0.0), total_steps)
+                                if 'cell_avg_row_entropy' in comps_avg:
+                                    writer.add_scalar('train/cell_avg_row_entropy', comps_avg.get('cell_avg_row_entropy', 0.0), total_steps)
+                                if 'sampler_avg_topk_weight' in comps_avg:
+                                    writer.add_scalar('train/sampler_avg_topk_weight', comps_avg.get('sampler_avg_topk_weight', 0.0), total_steps)
+                                if 'sampler_avg_topk_max' in comps_avg:
+                                    writer.add_scalar('train/sampler_avg_topk_max', comps_avg.get('sampler_avg_topk_max', 0.0), total_steps)
+                                if 'sampler_coverage_ratio' in comps_avg:
+                                    writer.add_scalar('train/sampler_coverage_ratio', comps_avg.get('sampler_coverage_ratio', 0.0), total_steps)
+                            if csv_writer is not None:
+                                csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}", f"{comps_avg.get('token_ce', 0.0):.6f}", f"{comps_avg.get('gate_bce', 0.0):.6f}", f"{comps_avg.get('think_nce', 0.0):.6f}", 'train'])
+                            maybe_prune_regrow(model, total_steps)
+                            if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+                                save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                            if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
+                                val_loss = validate_model(model, epoch=epoch, optimizer=optimizer, csv_writer=csv_writer)
+                                print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
+                                # 调度器（plateau）按验证损失 step
+
+                    finally:
+                        # 记录进度，用于断点续训
+                        try:
+                            prog = {
+                                'epoch': epoch+1,
+                                'total_steps': total_steps,
+                                'last_chunk': chunk_name,
+                                'live_start_line': int(end_line),
+                            }
+                            os.makedirs(getattr(config, 'CHECKPOINT_DIR', './checkpoints'), exist_ok=True)
+                            with open(progress_path, 'w', encoding='utf-8') as pf:
+                                json.dump(prog, pf, ensure_ascii=False)
+                        except Exception:
+                            pass
+
+            elif getattr(config, 'USE_STREAMING_TRAIN', True):
+                # ========= 离线流式训练：逐块加载与训练 =========
                 print("启用流式训练：按 chunk 逐块加载与训练（后台预取）")
                 for chunk_name, chunk_data in stream_chunks(train_data_dir, prefetch=getattr(config, 'STREAM_PREFETCH', True)):
                     try:

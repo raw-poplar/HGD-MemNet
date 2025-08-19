@@ -184,6 +184,14 @@ ATTENTION_TYPE = "bahdanau"
 # ------------------------------------
 # 是否启用按 chunk 流式训练；开启后训练会逐块加载数据，并在训练当前块时后台预取下一块
 USE_STREAMING_TRAIN = True
+# 可选：启用“在线数据处理+训练”（生产者-消费者，训练端跟随新chunk）
+ENABLE_LIVE_STREAM_TRAIN = False  # 开启时训练端将跟随新增的 chunk_*.pt 持续训练
+LIVE_STREAM_MODE = "memory"       # "memory" | "disk" - 内存队列 vs 磁盘chunk
+LIVE_STREAM_CHUNK_SIZE = 1000     # 处理端每生成多少条对话写一个chunk（建议1000）
+LIVE_STREAM_MAX_PENDING = 5       # 最多允许未消费的chunk个数（>则暂停/减缓生产）
+LIVE_STREAM_POLL_SEC = 2          # 训练端轮询新chunk的时间间隔（秒，仅disk模式）
+LIVE_STREAM_MEMORY_QUEUE_SIZE = 10 # 内存队列最大块数（仅memory模式）
+
 # 流式验证与测试
 USE_STREAMING_VALIDATE = True
 USE_STREAMING_TEST = True

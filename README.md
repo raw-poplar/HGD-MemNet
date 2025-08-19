@@ -181,23 +181,61 @@ pip install -r requirements.txt
 
 ### 3. 准备数据
 
-1.  将您的原始对话数据集（例如 LCCC 数据集的 `train.json`, `valid.json`）放置在某个目录下。假设您放到了 `raw_data/` 中。
+1. 将原始对话数据集（例如 LCCC 的 `LCCC-base_train.json`、`LCCC-base_valid.json`、`LCCC-base_test.json`）放到 `config.dataset_path` 指定的目录下（见 config.py）。
 
-2.  **重要**: 修改 `config.py` 文件，更新以下路径变量以指向您的数据位置：
-    *   `RAW_DATA_DIR`: 指向您存放原始数据的地方 (例如 `'raw_data/'`)。
-    *   `LCCC_PROCESSED_PATH`: 指向您希望存放预处理后的二进制数据的目录 (例如 `'processed_data/'`)。
-
-3.  **构建词汇表**: 首先需要从数据中构建词汇表
+2. 构建词汇表（一次即可，训练与预处理都使用同一份）：
     ```bash
     # 快速构建词汇表（推荐）
     python -m src.data_processing.vocabulary.build_vocab_quick
 
-    # 或者自定义参数
+    # 或自定义参数
     python -m src.data_processing.vocabulary.build_vocabulary --vocab_size 30000 --min_freq 2
-
-    # 测试词汇表构建工具
-    python -m src.data_processing.vocabulary.test_vocabulary_builder
     ```
+
+3. 预处理为二进制 chunk（基础/离线模式）：
+    ```bash
+    python -m src.data_processing.prepare_binary_data --num_workers 4
+    ```
+
+4. （可选）统计检查：
+    - 目标长度分布、Top 词频，确认不再出现“所有目标仅为 [EOS, 某常见词]”的异常
+
+### 4. 训练模式
+
+本项目支持两种训练模式，可通过 config.py 开关切换：
+
+- 基础（离线）流式训练（默认）：
+  - 先预处理为分块二进制（chunk_*.pt），再按块流式训练
+  - 相关配置：
+    - USE_STREAMING_TRAIN=True
+    - STREAM_PREFETCH=True, STREAM_DATALOADER_NUM_WORKERS=0
+  - 启动：
+    ```bash
+    python -m src.train
+    ```
+
+- 在线（内存队列）流式训练：
+  - 边处理 jsonl 边训练；逐行读取，不需一次性加载全量 jsonl
+  - 训练仅对 train 启用在线流式；valid/test 建议使用离线固定集，保证评估可比
+  - 相关配置：
+    - ENABLE_LIVE_STREAM_TRAIN=True
+    - LIVE_STREAM_MODE="memory"
+    - LIVE_STREAM_CHUNK_SIZE=1000
+    - LIVE_STREAM_MEMORY_QUEUE_SIZE=10
+  - 断点续训：
+    - 训练会把 last_consumed_chunk、total_steps、live_start_line 写入 `checkpoints/train_progress.json`
+    - 续训时自动从 `live_start_line` 继续读取 jsonl
+  - 启动：
+    ```bash
+    python -m src.train
+    ```
+
+### 5. 注意事项与建议
+
+- 词表构建与数据预处理使用同一套分词/清理逻辑（jieba 优先，不可用时回退到正则规则；NFKC 归一化、去 URL/邮箱/emoji、小写英文、数字>4位归一化为 <NUM>）。
+- 若发现目标过短/过于单一（例如只出现 <2 个非 PAD token 的回复），可以在预处理阶段做下采样，或在训练时调整采样策略，避免训练早期被“简单样本”主导。
+- 验证/测试集建议一次性离线生成并固定使用，避免在线构建带来的随机性影响评估稳定性。
+- Windows 平台上建议在线内存流式使用 threading+Queue 方式，避免 multiprocessing 的大张量序列化开销。
 
 4.  运行数据预处理脚本。该脚本会读取 `RAW_DATA_DIR` 中的数据，并将其处理后保存到 `LCCC_PROCESSED_PATH`。
 
