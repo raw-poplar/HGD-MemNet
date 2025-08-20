@@ -139,44 +139,79 @@ def deserialize_tensor_data(serializable_data):
 
 def process_dialogue_to_tensors(dialogue_list, vocab):
     """
-    将对话列表转换为张量格式
-
-    Args:
-        dialogue_list: 对话列表，每个元素是 {"text": "..."}
-        vocab: 词汇表对象
-
-    Returns:
-        tuple: (x_ref_tensor, steps_data) 或 None
+    将一条 jsonl 对话样本转换为 (x_ref_tensor, steps_data)；兼容两种输入格式：
+    1) 发言列表格式：[{"text": "..."}, {"text": "..."}, ...]
+       - 按 config.THINKING_STEPS 自动插入思考步（gate=0），最后一步为输出步（gate=1）
+    2) 步骤格式：[{"step":i, "input_text":..., "target_text":..., "gate_signal":0/1}, ...]
+       - 直接使用 gate_signal 构造思考/输出步；x_t 取上一有效 input_text；target 取 target_text
     """
-    if len(dialogue_list) < 2:
+    if not isinstance(dialogue_list, list) or len(dialogue_list) == 0:
         return None
 
     try:
-        # 参考句子（第一句话）
-        x_ref_text = dialogue_list[0].get("text", "")
-        x_ref_tensor = torch.tensor(indexesFromSentence(vocab, x_ref_text), dtype=torch.long)
+        # 检测格式：若存在 input_text/target_text/gate_signal 视为“步骤格式”
+        is_step_fmt = False
+        for item in dialogue_list:
+            if isinstance(item, dict) and (('input_text' in item) or ('target_text' in item) or ('gate_signal' in item)):
+                is_step_fmt = True
+                break
+
+        # 公共工具：文本→索引张量
+        def _to_ids(text: str):
+            ids = indexesFromSentence(vocab, text or "")
+            return torch.tensor(ids, dtype=torch.long)
 
         steps_data = []
 
-        # 处理每一轮对话
-        for i in range(1, len(dialogue_list)):
-            target_text = dialogue_list[i].get("text", "")
+        if is_step_fmt:
+            # 步骤格式
+            # 1) 参考句：取第一条非空 input_text（若都为空则取空串）
+            x_ref_text = ""
+            for it in dialogue_list:
+                t = (it.get('input_text') or "") if isinstance(it, dict) else ""
+                if t and isinstance(t, str):
+                    x_ref_text = t
+                    break
+            x_ref_tensor = _to_ids(x_ref_text)
 
-            # 思考步骤 (THINKING_STEPS 次)
-            for _ in range(config.THINKING_STEPS):
-                thinking_step_x_t = None  # 修改：思考步骤中x_t为None
-                thinking_step_target = torch.tensor([], dtype=torch.long)
-                thinking_step_gate = torch.tensor([0.0], dtype=torch.float)
-                steps_data.append((thinking_step_x_t, thinking_step_target, thinking_step_gate))
+            # 2) 遍历步骤，构造 steps_data
+            last_input_text = None
+            for it in dialogue_list:
+                if not isinstance(it, dict):
+                    continue
+                gate = float(it.get('gate_signal', 0.0) or 0.0)
+                in_txt = it.get('input_text') if it.get('input_text') is not None else last_input_text
+                tgt_txt = it.get('target_text')
 
-            # 输出步骤
-            x_t_text = dialogue_list[i-1].get("text", "")
-            output_step_x_t = torch.tensor(indexesFromSentence(vocab, x_t_text), dtype=torch.long)
-            output_step_target = torch.tensor(indexesFromSentence(vocab, target_text), dtype=torch.long)
-            output_step_gate = torch.tensor([1.0], dtype=torch.float)
-            steps_data.append((output_step_x_t, output_step_target, output_step_gate))
+                if it.get('input_text') is not None:
+                    last_input_text = it['input_text']
 
-        return (x_ref_tensor, steps_data)
+                if gate >= 1.0:  # 输出步
+                    x_t_tensor = _to_ids(in_txt or "") if (in_txt is not None) else _to_ids(last_input_text or "")
+                    tgt_tensor = _to_ids(tgt_txt or "")
+                    gate_tensor = torch.tensor([1.0], dtype=torch.float)
+                    steps_data.append((x_t_tensor, tgt_tensor, gate_tensor))
+                else:  # 思考步
+                    x_t_tensor = None  # 思考步 x_t 设为 None；collate 时自动填空
+                    tgt_tensor = torch.tensor([], dtype=torch.long)  # 无目标
+                    gate_tensor = torch.tensor([0.0], dtype=torch.float)
+                    steps_data.append((x_t_tensor, tgt_tensor, gate_tensor))
+        else:
+            # 发言列表格式
+            if len(dialogue_list) < 2:
+                return None
+            x_ref_text = dialogue_list[0].get("text", "")
+            x_ref_tensor = _to_ids(x_ref_text)
+            for i in range(1, len(dialogue_list)):
+                target_text = dialogue_list[i].get("text", "")
+                # 思考步骤 (THINKING_STEPS 次)
+                for _ in range(config.THINKING_STEPS):
+                    steps_data.append((None, torch.tensor([], dtype=torch.long), torch.tensor([0.0], dtype=torch.float)))
+                # 输出步骤
+                x_t_text = dialogue_list[i-1].get("text", "")
+                steps_data.append((_to_ids(x_t_text), _to_ids(target_text), torch.tensor([1.0], dtype=torch.float)))
+
+        return (x_ref_tensor, steps_data) if steps_data else None
 
     except Exception:
         return None

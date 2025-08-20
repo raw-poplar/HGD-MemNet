@@ -24,6 +24,9 @@ import logging  # 新增：日志记录
 import gc
 from concurrent.futures import ThreadPoolExecutor
 
+# 线程/队列（内存流式）
+import threading
+from queue import Queue
 # 设置日志
 logging.basicConfig(filename='train.log', level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
@@ -31,6 +34,43 @@ logging.basicConfig(filename='train.log', level=logging.INFO, format='%(asctime)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 可选：确定性设置（由 config 决定）
 if getattr(config, 'DETERMINISTIC', False):
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+# --- 调试辅助：ID序列解码为token列表 ---
+def _decode_ids_to_tokens(ids_tensor, vocab, max_len: int = 100):
+    try:
+        ids = ids_tensor.detach().cpu().tolist()
+    except Exception:
+        try:
+            ids = list(ids_tensor)
+        except Exception:
+            return []
+    toks = []
+    for i, idx in enumerate(ids):
+        if i >= max_len:
+            toks.append("<...>")
+            break
+        if idx == getattr(config, 'PAD_token', 0):
+            continue
+        toks.append(vocab.index2word.get(idx, f"<UNK:{idx}>"))
+        if idx == getattr(config, 'EOS_token', 2):
+            break
+    return toks
+
+# 从 steps_data 中提取“最终目标序列”（最后一个非 None 的 y_t）
+def _extract_final_target_from_steps(steps_data, sample_idx: int = 0):
+    final_y = None
+    for _x_t, y_t, _g_t in steps_data:
+        if y_t is not None:
+            # 记录最新的非 None 目标
+            final_y = y_t
+    if final_y is None:
+        return None
+    try:
+        return final_y[sample_idx]
+    except Exception:
+        return None
+
     cudnn.benchmark = False
     cudnn.deterministic = True
 
@@ -460,6 +500,53 @@ def stream_live_jsonl(file_path: str, vocab, chunk_size: int = 1000, start_line:
                 continue
     if buf:
         yield f"live_chunk_{idx}", buf, end_line
+
+# ========= Live 内存队列生产者 =========
+class _LiveProducer(threading.Thread):
+    def __init__(self, file_path: str, vocab, queue: Queue, chunk_size: int = 1000, start_line: int = 0):
+        super().__init__(daemon=True)
+        self.file_path = file_path
+        self.vocab = vocab
+        self.queue = queue
+        self.chunk_size = max(1, int(chunk_size))
+        self.start_line = max(0, int(start_line))
+        self._stop_evt = threading.Event()
+        self.end_line = self.start_line
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        try:
+            from src.data_processing.prepare_binary_data import process_dialogue_to_tensors
+            buf = []
+            idx = 0
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                for ln, line in enumerate(f):
+                    if self._stop_evt.is_set():
+                        break
+                    if ln < self.start_line:
+                        continue
+                    try:
+                        dialogue = json.loads(line)
+                        item = process_dialogue_to_tensors(dialogue, self.vocab)
+                        if item:
+                            buf.append(item)
+                        self.end_line = ln + 1  # 下次从该行开始
+                        if len(buf) >= self.chunk_size:
+                            self.queue.put((f"live_chunk_{idx}", buf, self.end_line))
+                            buf = []
+                            idx += 1
+                    except Exception:
+                        continue
+            if buf and not self._stop_evt.is_set():
+                self.queue.put((f"live_chunk_{idx}", buf, self.end_line))
+        finally:
+            # 发送哨兵，通知消费端结束
+            try:
+                self.queue.put(None)
+            except Exception:
+                pass
 
 # ========= Chunk 流式加载工具 =========
 from typing import List
@@ -1245,9 +1332,13 @@ def train_model():
         raise
 
 if __name__ == "__main__":
-    train_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
-    if not os.path.isdir(train_dir):
-        print(f"错误: 未找到处理后的二进制数据目录 '{train_dir}'。")
-        print("请先运行 'python -m src.data_processing.prepare_binary_data' 来生成数据。")
-    else:
+    # 若启用在线内存流式训练，直接进入训练主流程（不依赖预处理的 chunk 目录）
+    if getattr(config, 'ENABLE_LIVE_STREAM_TRAIN', False) and getattr(config, 'LIVE_STREAM_MODE', 'memory') == 'memory':
         train_model()
+    else:
+        train_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
+        if not os.path.isdir(train_dir):
+            print(f"错误: 未找到处理后的二进制数据目录 '{train_dir}'。")
+            print("请先运行 'python -m src.data_processing.prepare_binary_data' 来生成数据，或启用 ENABLE_LIVE_STREAM_TRAIN。")
+        else:
+            train_model()

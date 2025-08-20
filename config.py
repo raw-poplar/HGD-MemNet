@@ -185,7 +185,7 @@ ATTENTION_TYPE = "bahdanau"
 # 是否启用按 chunk 流式训练；开启后训练会逐块加载数据，并在训练当前块时后台预取下一块
 USE_STREAMING_TRAIN = True
 # 可选：启用“在线数据处理+训练”（生产者-消费者，训练端跟随新chunk）
-ENABLE_LIVE_STREAM_TRAIN = False  # 开启时训练端将跟随新增的 chunk_*.pt 持续训练
+ENABLE_LIVE_STREAM_TRAIN = True  # 开启时训练端将跟随新增的 chunk_*.pt 持续训练
 LIVE_STREAM_MODE = "memory"       # "memory" | "disk" - 内存队列 vs 磁盘chunk
 LIVE_STREAM_CHUNK_SIZE = 1000     # 处理端每生成多少条对话写一个chunk（建议1000）
 LIVE_STREAM_MAX_PENDING = 5       # 最多允许未消费的chunk个数（>则暂停/减缓生产）
@@ -226,7 +226,7 @@ CSV_LOG_PATH = "./logs/train_metrics.csv"
 
 # 调试开关：打印 token_ce 相关诊断（默认关闭，避免刷屏）
 DEBUG_TOKEN_CE = True
-DEBUG_TOKEN_CE_EVERY_N = 1000  # 每多少总步打印一次 debug（建议 >=1000）
+DEBUG_TOKEN_CE_EVERY_N = 1000  # 每训练多少“对话样本”打印一次调试摘要（而非按内部步）。设为0关闭。
 
 # 语言 CE 的 label smoothing 系数（0 表示关闭）；建议 0.05 起步
 LABEL_SMOOTHING = 0.05
@@ -353,14 +353,15 @@ PROCESSED_DATA_PATH_CORNELL = "./data/cornell_processed/processed_dialogues.json
 # 示例：在 PowerShell 中可设：$env:DATASET_PATH="D:/datasets"
 # 原始 LCCC 文件命名可根据你的实际下载情况调整。
 
-dataset_path = os.environ.get('DATASET_PATH', 'F:/modelTrain')
-LCCC_RAW_PATH = os.path.join(dataset_path, 'LCCC')
-LCCC_TRAIN_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_train.json')
-LCCC_VALID_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_valid.json')
-LCCC_TEST_FILE = os.path.join(LCCC_RAW_PATH, 'LCCC-base_test.json')
+dataset_path = os.environ.get('DATASET_PATH', 'F:\modelTrain\data\lccc_processed')
+# LCCC_RAW_PATH = os.path.join(dataset_path, 'LCCC')
+LCCC_TRAIN_FILE = os.path.join(dataset_path, 'train.jsonl')
+LCCC_VALID_FILE = os.path.join(dataset_path, 'valid.jsonl')
+LCCC_TEST_FILE = os.path.join(dataset_path, 'test.jsonl')
 
 # 处理后的数据保存路径（预处理脚本输出目录）。
-LCCC_PROCESSED_PATH = os.path.join(dataset_path, 'data', 'lccc_processed')
+# 对于 jsonl 在线流式场景，PROCESSED_PATH 可直接指向包含 jsonl 的目录
+LCCC_PROCESSED_PATH = dataset_path
 
 
 # 最小与最大对话长度（按句子计数），用于数据清洗或过滤。
