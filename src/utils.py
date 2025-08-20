@@ -91,7 +91,8 @@ def compute_loss(
 
     # 2) 输出语言损失
     if target_padded is not None and output_logits is not None:
-        ce = nn.CrossEntropyLoss(ignore_index=config.PAD_token)
+        smoothing = float(getattr(config, 'LABEL_SMOOTHING', 0.0) or 0.0)
+        ce = nn.CrossEntropyLoss(ignore_index=config.PAD_token, label_smoothing=smoothing)
         if output_logits.dim() == 2:
             if target_padded.dim() == 2:
                 # 选择每个样本中第一个非 PAD 的目标作为监督；若整行均为 PAD，则设置为 PAD（将被 ignore）

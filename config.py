@@ -228,6 +228,9 @@ CSV_LOG_PATH = "./logs/train_metrics.csv"
 DEBUG_TOKEN_CE = True
 DEBUG_TOKEN_CE_EVERY_N = 1000  # 每多少总步打印一次 debug（建议 >=1000）
 
+# 语言 CE 的 label smoothing 系数（0 表示关闭）；建议 0.05 起步
+LABEL_SMOOTHING = 0.05
+
 # THINK_LOSS warmup 步数（0 表示关闭）。建议设为若干验证间隔的总步数，如 5*VALIDATE_EVERY_N_STEPS
 # 注意：需在 VALIDATE_EVERY_N_STEPS 定义之后设置；此处仅占位，真正值在下方定义
 THINK_WARMUP_STEPS = None
