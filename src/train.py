@@ -234,6 +234,20 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                 info_nce_tau=getattr(config, 'THINK_INFO_TAU', 0.1),
                 return_components=True,
             )
+            # 若损失为 NaN/Inf，记录上下文并回退为0，避免污染统计
+            if torch.isnan(step_loss) or torch.isinf(step_loss):
+                try:
+                    dbg = {
+                        't': t+1,
+                        'has_target': target_padded is not None,
+                        'x_t_shape': tuple(x_t_padded.shape) if x_t_padded is not None else None,
+                        'logits_shape': tuple(output_logits.shape) if output_logits is not None else None,
+                        'gate_mean': float(torch.sigmoid(gate_pred).mean().item()) if gate_pred is not None else None,
+                    }
+                    print(f"[WARNING] NaN/Inf step_loss detected, context: {dbg}")
+                except Exception:
+                    pass
+                step_loss = torch.zeros((), device=DEVICE)
             # 统计：该步是否存在非PAD标签
             try:
                 if target_padded is not None and target_padded.dim() == 2:
@@ -391,15 +405,22 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                 pass
 
         # 梯度累积：对损失做平均再反传
-        scaled_loss = step_loss / acc_steps
-        scaler.scale(scaled_loss).backward()
+        # 数值保护：若 step_loss 为 NaN/Inf，跳过该步反传，避免污染梯度
+        if torch.isnan(step_loss) or torch.isinf(step_loss):
+            print(f"[WARNING] step_loss is NaN/Inf at inner step t={t+1}, skip backward")
+        else:
+            scaled_loss = step_loss / acc_steps
+            scaler.scale(scaled_loss).backward()
 
         # 满足累积步数或到步尾时再执行优化器更新
         if ((t + 1) % acc_steps == 0):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            try:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            except Exception as _e:
+                print(f"[WARNING] optimizer.step/update failed (possibly due to NaN grads): {_e}; performing gradient reset")
             optimizer.zero_grad()
 
         total_batch_loss += step_loss.item()
@@ -627,23 +648,26 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
                             chunk_data = chunk_data[:remaining]
 
                         val_dataset = _ChunkListDataset(chunk_data)
+                        # 注意：在部分 Windows + CUDA 环境下，pin_memory + non_blocking 组合可能触发底层 CUDAEvent 错误
+                        # 因此验证/测试阶段一律关闭 pin_memory，以提高稳定性（对速度影响可忽略）
                         val_loader = DataLoader(
                             val_dataset,
                             batch_size=config.BATCH_SIZE,
                             collate_fn=binary_collate_fn,
                             num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
                             shuffle=False,
-                            pin_memory=torch.cuda.is_available(),
+                            pin_memory=False,
                         )
                         pbar = tqdm(val_loader, desc=f"正在验证 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                            # 验证阶段禁用非阻塞拷贝，避免触发 CUDAEvent::record 相关崩溃
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
                             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
                             for x_t, y_t, g_t in steps_data:
-                                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
-                                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
-                                g_t = g_t.to(DEVICE, non_blocking=True)
+                                x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
+                                y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
+                                g_t = g_t.to(DEVICE, non_blocking=False)
 
                                 h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
 
@@ -695,20 +719,20 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
                 batch_size=config.BATCH_SIZE,
                 collate_fn=binary_collate_fn,
                 num_workers=min(os.cpu_count(), 2),
-                pin_memory=torch.cuda.is_available(),
+                pin_memory=False,
                 persistent_workers=True,
                 prefetch_factor=2,
                 shuffle=False,
             )
             pbar = tqdm(val_loader, desc="正在验证")
             for x_ref_padded, steps_data in pbar:
-                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
                 h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
                 for x_t, y_t, g_t in steps_data:
-                    x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
-                    y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
-                    g_t = g_t.to(DEVICE, non_blocking=True)
+                    x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
+                    g_t = g_t.to(DEVICE, non_blocking=False)
 
                     h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
 
@@ -754,11 +778,11 @@ def test_model(model):
                             collate_fn=binary_collate_fn,
                             num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
                             shuffle=False,
-                            pin_memory=torch.cuda.is_available(),
+                            pin_memory=False,
                         )
                         pbar = tqdm(test_loader, desc=f"正在测试 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
                             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
                             for x_t, y_t, g_t in steps_data:
@@ -796,20 +820,20 @@ def test_model(model):
                 batch_size=config.BATCH_SIZE,
                 collate_fn=binary_collate_fn,
                 num_workers=min(os.cpu_count(), 2),
-                pin_memory=torch.cuda.is_available(),
+                pin_memory=False,
                 persistent_workers=True,
                 prefetch_factor=2,
                 shuffle=False,
             )
             pbar = tqdm(test_loader, desc="正在测试")
             for x_ref_padded, steps_data in pbar:
-                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
                 h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
                 for x_t, y_t, g_t in steps_data:
-                    x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
-                    y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
-                    g_t = g_t.to(DEVICE, non_blocking=True)
+                    x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
+                    g_t = g_t.to(DEVICE, non_blocking=False)
 
                     h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
 

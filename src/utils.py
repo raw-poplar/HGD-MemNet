@@ -74,9 +74,15 @@ def compute_loss(
     loss = zero.clone()
 
     # 1) 门控损失（若提供标签）
-    if gate_target is not None:
+    if gate_target is not None and gate_pred is not None:
         gp_logits = gate_pred.view(-1).float()
         gt = gate_target.view(-1).to(gp_logits.dtype)
+
+        # 数值稳定性检查
+        if torch.isnan(gp_logits).any() or torch.isinf(gp_logits).any():
+            print(f"[WARNING] gate_pred contains NaN/Inf: {gp_logits}")
+            gp_logits = torch.nan_to_num(gp_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+
         # 处理类别不均衡：正样本（发声）通常远少于负样本（思考）
         pos_w_cfg = getattr(config, 'GATE_POS_WEIGHT', None)
         if pos_w_cfg is not None:
@@ -87,6 +93,12 @@ def compute_loss(
         else:
             criterion = nn.BCEWithLogitsLoss()
         gate_bce = criterion(gp_logits, gt)
+
+        # 检查gate_bce是否为NaN
+        if torch.isnan(gate_bce) or torch.isinf(gate_bce):
+            print(f"[WARNING] gate_bce is NaN/Inf, replacing with 0.0")
+            gate_bce = zero.clone()
+
         loss = loss + gate_bce
 
     # 2) 输出语言损失
@@ -124,49 +136,34 @@ def compute_loss(
                 logits_flat = output_logits.reshape(B * L_eff, V)
                 labels_flat = target_padded.view(B, 1).expand(B, L_eff).reshape(B * L_eff)
             token_ce = ce(logits_flat, labels_flat.long())
-
-            # 调试：详细打印 CE 计算过程 + 简易准确率/标签概率
-            if getattr(config, 'DEBUG_TOKEN_CE', False):
-                try:
-                    pad_token = getattr(config, 'PAD_token', 0)
-                    valid_mask = (labels_flat != pad_token)
-                    valid_count = int(valid_mask.sum().item())
-                    unique_labels = torch.unique(labels_flat).tolist()
-                    print(f"[debug/ce_detail] labels_flat_shape={labels_flat.shape} valid_count={valid_count} unique_labels={unique_labels[:10]} token_ce={float(token_ce.item()):.6f}")
-                    if valid_count > 0:
-                        # 检查有效标签的范围
-                        valid_labels = labels_flat[valid_mask]
-                        min_label, max_label = int(valid_labels.min().item()), int(valid_labels.max().item())
-                        vocab_size = logits_flat.size(-1)
-                        print(f"[debug/ce_detail] valid_label_range=[{min_label}, {max_label}] vocab_size={vocab_size} out_of_range={max_label >= vocab_size}")
-                        # 简易准确率
-                        with torch.no_grad():
-                            preds = torch.argmax(logits_flat[valid_mask], dim=-1)
-                            acc = float((preds == valid_labels).float().mean().item())
-                            # 标签概率
-                            log_probs = torch.log_softmax(logits_flat[valid_mask], dim=-1)
-                            true_logp = log_probs[torch.arange(valid_labels.size(0), device=log_probs.device), valid_labels]
-                            true_p = torch.exp(true_logp).mean().item()
-                            print(f"[debug/ce_acc] acc={acc:.4f} true_p_mean={true_p:.4f}")
-                except Exception as e:
-                    print(f"[debug/ce_detail] error: {e}")
         else:
             token_ce = zero
-        if not torch.isnan(token_ce):
-            loss = loss + token_ce
+
+        # 数值保护：若 token_ce 为 NaN/Inf 则置零
+        if torch.isnan(token_ce) or torch.isinf(token_ce):
+            print("[WARNING] token_ce is NaN/Inf, replacing with 0.0")
+            token_ce = zero
+
+        loss = loss + token_ce
 
     # 3) 门控熵正则
     ge_w = gate_entropy_weight if gate_entropy_weight is not None else getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0)
-    if ge_w and ge_w > 0:
+    if ge_w and ge_w > 0 and gate_pred is not None:
         p = torch.sigmoid(gate_pred)
         p = torch.clamp(p, 1e-6, 1 - 1e-6)
         gate_entropy_reg = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
+        if torch.isnan(gate_entropy_reg) or torch.isinf(gate_entropy_reg):
+            print("[WARNING] gate_entropy_reg is NaN/Inf, replacing with 0.0")
+            gate_entropy_reg = zero
         loss = loss + ge_w * gate_entropy_reg
 
     # 4) 发声预算约束
     tsr = target_speak_ratio if target_speak_ratio is not None else getattr(config, 'TARGET_SPEAK_RATIO', None)
-    if tsr is not None:
+    if tsr is not None and gate_pred is not None:
         budget_reg = (torch.sigmoid(gate_pred).mean() - float(tsr)).abs()
+        if torch.isnan(budget_reg) or torch.isinf(budget_reg):
+            print("[WARNING] budget_reg is NaN/Inf, replacing with 0.0")
+            budget_reg = zero
         loss = loss + 0.1 * budget_reg
 
     # 5) 思考信息量损失（InfoNCE）
@@ -174,11 +171,23 @@ def compute_loss(
     if tlw and tlw > 0 and h_prev is not None and h_next is not None:
         z_q = F.normalize(h_next, dim=-1)
         z_k = F.normalize(h_prev.detach(), dim=-1)
+
+        # 若出现 NaN，进行兜底
+        if torch.isnan(z_q).any() or torch.isinf(z_q).any():
+            print("[WARNING] z_q contains NaN/Inf, applying nan_to_num")
+            z_q = torch.nan_to_num(z_q)
+        if torch.isnan(z_k).any() or torch.isinf(z_k).any():
+            print("[WARNING] z_k contains NaN/Inf, applying nan_to_num")
+            z_k = torch.nan_to_num(z_k)
+
         logits = torch.matmul(z_q, z_k.t())
         tau = info_nce_tau if info_nce_tau is not None else getattr(config, 'THINK_INFO_TAU', 0.1)
         logits = logits / max(tau, 1e-6)
         labels = torch.arange(logits.size(0), device=logits.device)
         think_nce = nn.CrossEntropyLoss()(logits, labels)
+        if torch.isnan(think_nce) or torch.isinf(think_nce):
+            print("[WARNING] think_nce is NaN/Inf, replacing with 0.0")
+            think_nce = zero
         loss = loss + tlw * think_nce
 
     if return_components:

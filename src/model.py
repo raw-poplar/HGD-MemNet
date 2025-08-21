@@ -57,7 +57,19 @@ class Attention(nn.Module):
             # 将被mask的位置设为 -inf，softmax 后权重为0
             scores = scores.masked_fill(~mask, float('-inf'))
 
+        # 数值稳定性处理：softmax 前后均做保护
         attn_weights = F.softmax(scores, dim=1)
+
+        # 若出现 NaN/Inf（如整行均为 padding），回退到安全分布
+        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+            if mask is not None:
+                # 对每个样本，若有效位置和为0，则使用均匀分布；否则按mask均匀分布
+                with torch.no_grad():
+                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                    safe = mask.float() / valid_counts
+                attn_weights = safe
+            else:
+                attn_weights = torch.ones_like(scores) / max(1, scores.size(1))
 
         # context shape: (batch_size, 1, hidden_dim)
         context = torch.bmm(attn_weights.unsqueeze(1), keys)
@@ -119,7 +131,7 @@ class MultiHeadAttention(nn.Module):
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
 
         # 计算注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5 * self.temperature)  # (batch_size, num_heads, 1, seq_len)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5 * max(float(self.temperature), 1e-6))  # (batch_size, num_heads, 1, seq_len)
 
         if mask is not None:
             # 扩展 mask 以匹配多头形状: (B, 1, 1, L)
@@ -131,7 +143,13 @@ class MultiHeadAttention(nn.Module):
 
         # 检查并修复NaN或无效值
         if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
-            attn_weights = torch.ones_like(attn_weights) / attn_weights.size(-1)  # 均匀分布作为fallback
+            if mask is not None:
+                with torch.no_grad():
+                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                    safe = mask.float() / valid_counts
+                attn_weights = safe.unsqueeze(1)  # (B,1,L) -> 广播到 (B, num_heads, 1, L) 时将在 matmul 前使用
+            else:
+                attn_weights = torch.ones_like(attn_weights) / attn_weights.size(-1)
 
         attn_weights = self.dropout(attn_weights)
 

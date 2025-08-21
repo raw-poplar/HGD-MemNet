@@ -225,7 +225,7 @@ CSV_LOG_PATH = "./logs/train_metrics.csv"
 # CSV 列扩展（分项指标）将自动写入：token_ce、gate_bce、think_nce
 
 # 调试开关：打印 token_ce 相关诊断（默认关闭，避免刷屏）
-DEBUG_TOKEN_CE = True
+DEBUG_TOKEN_CE = False
 DEBUG_TOKEN_CE_EVERY_N = 1000  # 每训练多少“对话样本”打印一次调试摘要（而非按内部步）。设为0关闭。
 
 # 语言 CE 的 label smoothing 系数（0 表示关闭）；建议 0.05 起步
