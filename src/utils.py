@@ -73,15 +73,18 @@ def compute_loss(
 
     loss = zero.clone()
 
+     # 在任意使用前，对 gate_pred 进行一次全局“去 NaN/Inf”净化，供后续所有分项复用
+    logits_sane = None
+    if gate_pred is not None:
+        try:
+            logits_sane = torch.nan_to_num(gate_pred, nan=0.0, posinf=10.0, neginf=-10.0)
+        except Exception:
+            logits_sane = gate_pred
+
     # 1) 门控损失（若提供标签）
     if gate_target is not None and gate_pred is not None:
-        gp_logits = gate_pred.view(-1).float()
+        gp_logits = (logits_sane if logits_sane is not None else gate_pred).view(-1).float()
         gt = gate_target.view(-1).to(gp_logits.dtype)
-
-        # 数值稳定性检查
-        if torch.isnan(gp_logits).any() or torch.isinf(gp_logits).any():
-            print(f"[WARNING] gate_pred contains NaN/Inf: {gp_logits}")
-            gp_logits = torch.nan_to_num(gp_logits, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # 处理类别不均衡：正样本（发声）通常远少于负样本（思考）
         pos_w_cfg = getattr(config, 'GATE_POS_WEIGHT', None)
@@ -149,7 +152,8 @@ def compute_loss(
     # 3) 门控熵正则
     ge_w = gate_entropy_weight if gate_entropy_weight is not None else getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0)
     if ge_w and ge_w > 0 and gate_pred is not None:
-        p = torch.sigmoid(gate_pred)
+        gp_for_entropy = logits_sane if logits_sane is not None else gate_pred
+        p = torch.sigmoid(gp_for_entropy)
         p = torch.clamp(p, 1e-6, 1 - 1e-6)
         gate_entropy_reg = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
         if torch.isnan(gate_entropy_reg) or torch.isinf(gate_entropy_reg):
@@ -160,7 +164,8 @@ def compute_loss(
     # 4) 发声预算约束
     tsr = target_speak_ratio if target_speak_ratio is not None else getattr(config, 'TARGET_SPEAK_RATIO', None)
     if tsr is not None and gate_pred is not None:
-        budget_reg = (torch.sigmoid(gate_pred).mean() - float(tsr)).abs()
+        gp_for_budget = logits_sane if logits_sane is not None else gate_pred
+        budget_reg = (torch.sigmoid(gp_for_budget).mean() - float(tsr)).abs()
         if torch.isnan(budget_reg) or torch.isinf(budget_reg):
             print("[WARNING] budget_reg is NaN/Inf, replacing with 0.0")
             budget_reg = zero
