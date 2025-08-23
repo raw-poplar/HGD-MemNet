@@ -8,8 +8,6 @@ import os
 import config # 导入全局配置
 from tqdm import tqdm
 import glob # 导入 glob 模块用于查找文件
-import random
-import psutil  # 新增：内存监控
 
 
 class Vocabulary:
@@ -93,6 +91,13 @@ class BinaryDialogueDataset(Dataset):
         if not os.path.isdir(directory_path):
             raise FileNotFoundError(f"二进制数据目录未找到: {directory_path}。请先运行 'prepare_binary_data.py'。")
         
+        # 兼容性安全加载：优先使用 weights_only=True，若环境不支持则回退
+        def _safe_torch_load(path):
+            try:
+                return torch.load(path, weights_only=True)
+            except TypeError:
+                return torch.load(path)
+
         # 查找并排序所有数据块文件
         self.chunk_files = sorted(
             glob.glob(os.path.join(directory_path, "chunk_*.pt")),
@@ -103,9 +108,14 @@ class BinaryDialogueDataset(Dataset):
             raise FileNotFoundError(f"在 '{directory_path}' 中未找到数据块文件 (chunk_*.pt)。")
 
         # 计算每个块的样本数和总样本数
-        self.chunk_lengths = [len(torch.load(f, weights_only=True)) for f in self.chunk_files]
-        self.cumulative_lengths = [0] + list(torch.cumsum(torch.tensor(self.chunk_lengths), dim=0))
-        self.total_length = self.cumulative_lengths[-1].item()
+        self.chunk_lengths = [len(_safe_torch_load(f)) for f in self.chunk_files]
+        # 使用纯整数进行累计，避免后续索引出现张量类型
+        self.cumulative_lengths = [0]
+        _running_total = 0
+        for _n in self.chunk_lengths:
+            _running_total += _n
+            self.cumulative_lengths.append(_running_total)
+        self.total_length = self.cumulative_lengths[-1]
 
         # 用于缓存当前加载的块，以避免重复IO
         self.current_chunk_index = -1
@@ -129,7 +139,11 @@ class BinaryDialogueDataset(Dataset):
         
         # 2. 如果需要的块不是当前缓存的块，则加载新块
         if chunk_index != self.current_chunk_index:
-            self.current_chunk_data = torch.load(self.chunk_files[chunk_index], weights_only=True)
+            # 复用安全加载器，保证不同 PyTorch 版本的兼容
+            try:
+                self.current_chunk_data = torch.load(self.chunk_files[chunk_index], weights_only=True)
+            except TypeError:
+                self.current_chunk_data = torch.load(self.chunk_files[chunk_index])
             self.current_chunk_index = chunk_index
         
         # 3. 计算在块内的局部索引

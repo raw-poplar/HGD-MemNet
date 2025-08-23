@@ -20,6 +20,7 @@ from .dataset import (
     binary_collate_fn,
 )
 from .utils import compute_loss, set_seed  # 新增：导入工具函数与随机种子
+from .utils import _WARN_COUNTS  # 引入节流计数（仅用于统计/复用，不直接打印）
 import logging  # 新增：日志记录
 import gc
 from concurrent.futures import ThreadPoolExecutor
@@ -149,6 +150,10 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     # 梯度累积设置（在样本的“内部思考步”维度累积）
     acc_steps = max(1, int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1))
     optimizer.zero_grad()
+    # 详细追踪：若开启详细打印收集，则缓存本 batch 第一个样本的详细步信息
+    collect_detail = bool(getattr(config, 'COLLECT_DETAIL_FOR_DEBUG', True))
+    detail_trace = [] if collect_detail else None
+
     for t in range(steps_available):
         x_t_padded, target_padded, gate_target = steps_data[t]
         x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
@@ -260,6 +265,55 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             try:
                 for k in list(comps_acc.keys()):
                     comps_acc[k] += comps.get(k, 0.0)
+            except Exception:
+                pass
+
+            # 详细收集（仅记录第一个样本，避免日志爆炸）
+            try:
+                if collect_detail:
+                    sample_idx = 0
+                    # 当前步的输入/标签形状、门控/温度、损失分项
+                    rec = {
+                        't': t+1,
+                        'x_t_shape': tuple(x_t_padded.shape) if x_t_padded is not None else None,
+                        'target_shape': tuple(target_padded.shape) if target_padded is not None else None,
+                        'gate_prob_mean': float(torch.sigmoid(gate_pred).mean().item()) if gate_pred is not None else None,
+                        'temperature': float(current_temperature),
+                        'loss': float(step_loss.detach().item()) if hasattr(step_loss, 'item') else float(step_loss),
+                        'comps': comps,
+                    }
+                    # 记录该步的 x_t token ids（样本0）供打印解码
+                    try:
+                        if x_t_padded is not None and x_t_padded.size(0) > sample_idx and x_t_padded.dim() == 2:
+                            ids0 = x_t_padded[sample_idx]
+                            # 截断到前 32 个非PAD token
+                            nonpad = ids0[ids0 != config.PAD_token]
+                            if nonpad.numel() > 0:
+                                rec['x_t_ids'] = [int(i) for i in nonpad[:32].detach().cpu().tolist()]
+                    except Exception:
+                        pass
+                    # 提取该样本的 token 预测与目标（末位时间步）
+                    try:
+                        if output_logits is not None:
+                            if output_logits.dim() == 3:
+                                logits_for_tok = output_logits[sample_idx, -1, :]
+                            else:
+                                logits_for_tok = output_logits[sample_idx]
+                            pred_id = int(torch.argmax(logits_for_tok).item())
+                            rec['pred_token'] = pred_id
+                            # top-5 预测
+                            try:
+                                probs_last = torch.softmax(logits_for_tok, dim=-1)
+                                k = min(5, probs_last.size(0))
+                                topk_vals, topk_idx = torch.topk(probs_last, k=k, dim=-1)
+                                rec['topk'] = list(zip([int(i) for i in topk_idx.detach().cpu().tolist()], [float(v) for v in topk_vals.detach().cpu().tolist()]))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # 记录该步是否有 target（作为“发声步”）
+                    rec['is_speak_step'] = bool(target_padded is not None)
+                    detail_trace.append(rec)
             except Exception:
                 pass
 
@@ -452,7 +506,7 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     # 分项平均（按步）
     comps_avg = {k: (v / max(1, steps_updated)) for k, v in comps_acc.items()}
 
-    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap), comps_avg
+    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap), comps_avg, detail_trace
 
 # 剪枝/再生长：按配置周期触发（最小实现，模块级函数）
 def maybe_prune_regrow(model, total_steps):
@@ -1060,6 +1114,44 @@ def train_model():
             if csv_f.tell() == 0:
                 csv_writer.writerow(['epoch', 'total_steps', 'avg_step_loss', 'lr', 'gate_mean', 'token_ce', 'gate_bce', 'think_nce', 'split'])
 
+        # 详细日志全局计数与下一个阈值（避免跨轮次重置导致连发）
+        try:
+            train_model._files_counter
+        except Exception:
+            train_model._files_counter = 0
+        try:
+            n_detail = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
+        except Exception:
+            n_detail = 0
+        if n_detail > 0:
+            # 如果尚未设置下一阈值，则设为严格大于当前计数的最近倍数
+            if not hasattr(train_model, '_detail_next_at') or train_model._detail_next_at is None:
+                k = (train_model._files_counter // n_detail) + 1
+                train_model._detail_next_at = k * n_detail
+        else:
+            train_model._detail_next_at = None
+
+        # 统一的详细日志输出器：支持落盘与控制台摘要
+        def _emit_detail_report(lines_summary: list[str], files_counter_val: int, total_steps_val: int, avg_loss_val: float, chunk_name_val: str | None = None):
+            to_console = bool(getattr(config, 'DETAIL_LOG_TO_CONSOLE', True))
+            to_file = bool(getattr(config, 'DETAIL_LOG_TO_FILE', True))
+            try:
+                if to_file:
+                    os.makedirs('logs', exist_ok=True)
+                    with open(os.path.join('logs', 'detail_report.txt'), 'a', encoding='utf-8') as f:
+                        f.write("\n".join(lines_summary))
+                        f.write("\n")
+                if to_console:
+                    print("\n".join(lines_summary))
+                else:
+                    # 控制台只打一行摘要，避免刷屏
+                    if chunk_name_val is None:
+                        print(f"[detail] saved files={files_counter_val} steps={total_steps_val} avg={avg_loss_val:.4f}")
+                    else:
+                        print(f"[detail] chunk={chunk_name_val} saved files={files_counter_val} steps={total_steps_val} avg={avg_loss_val:.4f}")
+            except Exception:
+                pass
+
         for epoch in range(start_epoch, config.NUM_EPOCHS):
             if getattr(config, 'ENABLE_LIVE_STREAM_TRAIN', False) and getattr(config, 'LIVE_STREAM_MODE', 'memory') == 'memory':
                 # ========= 在线内存流式训练：逐行处理 jsonl 并按内存 chunk 训练 =========
@@ -1093,7 +1185,7 @@ def train_model():
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
+                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
                                 x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
                             )
                             total_steps += steps_in_batch
@@ -1114,19 +1206,58 @@ def train_model():
                                 "门控均值": f"{gate_mean:.3f}",
                                 "cap触发": cap_hit,
                             })
-                            # 可选：周期性详细打印
+                            # 可选：按文件粒度的详细打印（每第 PRINT_DETAIL_EVERY_N_STEPS 个“文件”后）
                             try:
-                                n = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
-                                if n > 0 and (total_steps % n == 0):
-                                    print(
-                                        f"[detail] step={total_steps} avg={avg_loss:.4f} "
-                                        f"gate_bce={comps_avg.get('gate_bce', 0.0):.4f} "
-                                        f"token_ce={comps_avg.get('token_ce', 0.0):.4f} "
-                                        f"token_ce_eval={comps_avg.get('token_ce_eval', 0.0):.4f} "
-                                        f"think_nce={comps_avg.get('think_nce', 0.0):.4f} "
-                                        f"target_ratio={comps_avg.get('target_step_count', 0.0):.2f} "
-                                        f"tau={comps_avg.get('temperature', 0.0):.3f}"
-                                    )
+                                # 严格阈值：仅当累计样本数 >= 下一阈值时打印，然后推进下一阈值
+                                if train_model._detail_next_at is not None:
+                                    try:
+                                        train_model._files_counter += int(x_ref_padded.size(0))
+                                    except Exception:
+                                        pass
+                                    if train_model._files_counter >= train_model._detail_next_at:
+                                        # 汇总成多行文本（落盘或摘要）
+                                        lines = []
+                                        try:
+                                            toks = _decode_ids_to_tokens(x_ref_padded[0], vocab, max_len=64)
+                                        except Exception:
+                                            toks = []
+                                        try:
+                                            L0 = int((x_ref_padded[0] != config.PAD_token).sum().item())
+                                            emb_shape = [L0, getattr(config, 'EMBEDDING_DIM', None)]
+                                        except Exception:
+                                            emb_shape = None
+                                        lines.append("===== [DETAIL REPORT] =====")
+                                        lines.append(f"chunk={chunk_name} batch_size={x_ref_padded.size(0) if hasattr(x_ref_padded, 'size') else '?'} total_files={train_model._files_counter} total_steps={total_steps} avg_loss={avg_loss:.6f}")
+                                        lines.append(f"dialogue_tokens[0]={' '.join(toks)}")
+                                        lines.append(f"embed_shape_for_sample0={emb_shape}")
+                                        lines.append(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
+                                        for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                            xt = rec.get('x_t_ids')
+                                            xt_dec = ''
+                                            try:
+                                                if xt:
+                                                    xt_dec = ' '.join([vocab.index2word.get(i, f"<UNK:{i}>") for i in xt])
+                                            except Exception:
+                                                pass
+                                            pred_tok = ''
+                                            try:
+                                                pid = rec.get('pred_token')
+                                                if pid is not None:
+                                                    pred_tok = vocab.index2word.get(pid, f"<UNK:{pid}>")
+                                            except Exception:
+                                                pass
+                                            topk = rec.get('topk') or []
+                                            topk_fmt = ''
+                                            try:
+                                                if topk:
+                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                            except Exception:
+                                                pass
+                                            lines.append(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
+                                        lines.append("===== [END DETAIL] =====")
+                                        _emit_detail_report(lines, train_model._files_counter, total_steps, avg_loss, chunk_name)
+                                        # 推进下一阈值
+                                        train_model._detail_next_at += int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
                             except Exception:
                                 pass
 
@@ -1156,6 +1287,10 @@ def train_model():
                             maybe_prune_regrow(model, total_steps)
                             if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                                 save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                                try:
+                                    print("检查点保存完成，继续训练…")
+                                except Exception:
+                                    pass
                             if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
                                 val_loss = validate_model(model, epoch=epoch, optimizer=optimizer, csv_writer=csv_writer)
                                 print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")
@@ -1192,7 +1327,7 @@ def train_model():
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
+                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
                                 x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
                             )
                             total_steps += steps_in_batch
@@ -1213,19 +1348,53 @@ def train_model():
                                 "门控均值": f"{gate_mean:.3f}",
                                 "cap触发": cap_hit,
                             })
-                            # 可选：周期性详细打印（避免被 tqdm 覆盖）
+                            # 可选：按文件粒度的详细打印（每第 PRINT_DETAIL_EVERY_N_STEPS 个“文件”后）
                             try:
-                                n = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
-                                if n > 0 and (total_steps % n == 0):
-                                    print(
-                                        f"[detail] step={total_steps} avg={avg_loss:.4f} "
-                                        f"gate_bce={comps_avg.get('gate_bce', 0.0):.4f} "
-                                        f"token_ce={comps_avg.get('token_ce', 0.0):.4f} "
-                                        f"token_ce_eval={comps_avg.get('token_ce_eval', 0.0):.4f} "
-                                        f"think_nce={comps_avg.get('think_nce', 0.0):.4f} "
-                                        f"target_ratio={comps_avg.get('target_step_count', 0.0):.2f} "
-                                        f"tau={comps_avg.get('temperature', 0.0):.3f}"
-                                    )
+                                if train_model._detail_next_at is not None:
+                                    try:
+                                        train_model._files_counter += int(x_ref_padded.size(0))
+                                    except Exception:
+                                        pass
+                                    if train_model._files_counter >= train_model._detail_next_at:
+                                        try:
+                                            toks = _decode_ids_to_tokens(x_ref_padded[0], vocab, max_len=64)
+                                        except Exception:
+                                            toks = []
+                                        try:
+                                            L0 = int((x_ref_padded[0] != config.PAD_token).sum().item())
+                                            emb_shape = [L0, getattr(config, 'EMBEDDING_DIM', None)]
+                                        except Exception:
+                                            emb_shape = None
+                                        print("\n===== [DETAIL REPORT] =====")
+                                        print(f"chunk={chunk_name} batch_size={x_ref_padded.size(0) if hasattr(x_ref_padded, 'size') else '?'} total_files={files_counter} total_steps={total_steps} avg_loss={avg_loss:.6f}")
+                                        print(f"dialogue_tokens[0]={' '.join(toks)}")
+                                        print(f"embed_shape_for_sample0={emb_shape}")
+                                        print(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
+                                        for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                            xt = rec.get('x_t_ids')
+                                            xt_dec = ''
+                                            try:
+                                                if xt:
+                                                    xt_dec = ' '.join([vocab.index2word.get(i, f"<UNK:{i}>") for i in xt])
+                                            except Exception:
+                                                pass
+                                            pred_tok = ''
+                                            try:
+                                                pid = rec.get('pred_token')
+                                                if pid is not None:
+                                                    pred_tok = vocab.index2word.get(pid, f"<UNK:{pid}>")
+                                            except Exception:
+                                                pass
+                                            topk = rec.get('topk') or []
+                                            topk_fmt = ''
+                                            try:
+                                                if topk:
+                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                            except Exception:
+                                                pass
+                                            print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
+                                        print("===== [END DETAIL] =====\n")
+                                        train_model._detail_next_at += int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
                             except Exception:
                                 pass
 
@@ -1285,7 +1454,7 @@ def train_model():
                 )
                 pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
                 for x_ref_padded, steps_data in pbar:
-                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg = train_batch_stepwise(
+                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
                         x_ref_padded, steps_data, model, optimizer, scaler
                     )
                     total_steps += steps_in_batch
@@ -1312,8 +1481,66 @@ def train_model():
                     if csv_writer is not None:
                         csv_writer.writerow([epoch+1, total_steps, avg_loss, optimizer.param_groups[0]['lr'], f"{gate_mean:.4f}", f"{comps_avg.get('token_ce', 0.0):.6f}", f"{comps_avg.get('gate_bce', 0.0):.6f}", f"{comps_avg.get('think_nce', 0.0):.6f}", 'train'])
                     maybe_prune_regrow(model, total_steps)
+                    # 可选：按文件粒度的详细打印（每第 PRINT_DETAIL_EVERY_N_STEPS 个“文件”后）
+                    try:
+                        n = int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
+                        if n > 0:
+                            try:
+                                files_counter = getattr(train_model, '_files_counter', 0)
+                            except Exception:
+                                files_counter = 0
+                            try:
+                                files_counter += int(x_ref_padded.size(0))
+                            except Exception:
+                                files_counter += 0
+                            setattr(train_model, '_files_counter', files_counter)
+                            if files_counter % n == 0:
+                                try:
+                                    toks = _decode_ids_to_tokens(x_ref_padded[0], vocab, max_len=64)
+                                except Exception:
+                                    toks = []
+                                try:
+                                    L0 = int((x_ref_padded[0] != config.PAD_token).sum().item())
+                                    emb_shape = [L0, getattr(config, 'EMBEDDING_DIM', None)]
+                                except Exception:
+                                    emb_shape = None
+                                print("\n===== [DETAIL REPORT] =====")
+                                print(f"total_files={files_counter} total_steps={total_steps} avg_loss={avg_loss:.6f}")
+                                print(f"dialogue_tokens[0]={' '.join(toks)}")
+                                print(f"embed_shape_for_sample0={emb_shape}")
+                                print(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
+                                for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                    xt = rec.get('x_t_ids')
+                                    xt_dec = ''
+                                    try:
+                                        if xt:
+                                            xt_dec = ' '.join([vocab.index2word.get(i, f"<UNK:{i}>") for i in xt])
+                                    except Exception:
+                                        pass
+                                    pred_tok = ''
+                                    try:
+                                        pid = rec.get('pred_token')
+                                        if pid is not None:
+                                            pred_tok = vocab.index2word.get(pid, f"<UNK:{pid}>")
+                                    except Exception:
+                                        pass
+                                    topk = rec.get('topk') or []
+                                    topk_fmt = ''
+                                    try:
+                                        if topk:
+                                            topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                    except Exception:
+                                        pass
+                                    print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
+                                print("===== [END DETAIL] =====\n")
+                    except Exception:
+                        pass
                     if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
                         save_checkpoint(model, optimizer, scaler, epoch, total_steps, config.CHECKPOINT_DIR)
+                        try:
+                            print("检查点保存完成，继续训练…")
+                        except Exception:
+                            pass
                     if total_steps > 0 and total_steps % config.VALIDATE_EVERY_N_STEPS == 0:
                         val_loss = validate_model(model, epoch=epoch, optimizer=optimizer, csv_writer=csv_writer)
                         print(f"\n--- 验证 (总步数: {total_steps}) | 当前损失: {val_loss:.4f} | 最佳损失: {best_val_loss:.4f} ---")

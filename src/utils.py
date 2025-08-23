@@ -7,6 +7,20 @@ import config
 from .model import HGD_MemNet
 from typing import Optional
 
+# 告警节流（避免刷屏）
+_WARN_COUNTS = {}
+def _warn_throttled(tag: str, message: str):
+    try:
+        every_n = int(getattr(config, 'NUMERIC_WARNINGS_EVERY_N', 100) or 0)
+    except Exception:
+        every_n = 100
+    if every_n <= 0:
+        return
+    c = _WARN_COUNTS.get(tag, 0) + 1
+    _WARN_COUNTS[tag] = c
+    if c % every_n == 0:
+        print(message)
+
 def load_model_from_checkpoint(directory, device):
     """从指定目录加载最新的模型检查点。"""
     if not os.path.exists(directory):
@@ -142,9 +156,9 @@ def compute_loss(
         else:
             token_ce = zero
 
-        # 数值保护：若 token_ce 为 NaN/Inf 则置零
+        # 数值保护：若 token_ce 为 NaN/Inf 则置零（节流打印）
         if torch.isnan(token_ce) or torch.isinf(token_ce):
-            print("[WARNING] token_ce is NaN/Inf, replacing with 0.0")
+            _warn_throttled('token_ce_nan', "[WARNING] token_ce is NaN/Inf, replacing with 0.0")
             token_ce = zero
 
         loss = loss + token_ce
@@ -157,7 +171,7 @@ def compute_loss(
         p = torch.clamp(p, 1e-6, 1 - 1e-6)
         gate_entropy_reg = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
         if torch.isnan(gate_entropy_reg) or torch.isinf(gate_entropy_reg):
-            print("[WARNING] gate_entropy_reg is NaN/Inf, replacing with 0.0")
+            _warn_throttled('gate_entropy_nan', "[WARNING] gate_entropy_reg is NaN/Inf, replacing with 0.0")
             gate_entropy_reg = zero
         loss = loss + ge_w * gate_entropy_reg
 
@@ -167,7 +181,7 @@ def compute_loss(
         gp_for_budget = logits_sane if logits_sane is not None else gate_pred
         budget_reg = (torch.sigmoid(gp_for_budget).mean() - float(tsr)).abs()
         if torch.isnan(budget_reg) or torch.isinf(budget_reg):
-            print("[WARNING] budget_reg is NaN/Inf, replacing with 0.0")
+            _warn_throttled('budget_reg_nan', "[WARNING] budget_reg is NaN/Inf, replacing with 0.0")
             budget_reg = zero
         loss = loss + 0.1 * budget_reg
 
@@ -179,10 +193,10 @@ def compute_loss(
 
         # 若出现 NaN，进行兜底
         if torch.isnan(z_q).any() or torch.isinf(z_q).any():
-            print("[WARNING] z_q contains NaN/Inf, applying nan_to_num")
+            _warn_throttled('zq_nan', "[WARNING] z_q contains NaN/Inf, applying nan_to_num")
             z_q = torch.nan_to_num(z_q)
         if torch.isnan(z_k).any() or torch.isinf(z_k).any():
-            print("[WARNING] z_k contains NaN/Inf, applying nan_to_num")
+            _warn_throttled('zk_nan', "[WARNING] z_k contains NaN/Inf, applying nan_to_num")
             z_k = torch.nan_to_num(z_k)
 
         logits = torch.matmul(z_q, z_k.t())
@@ -191,7 +205,7 @@ def compute_loss(
         labels = torch.arange(logits.size(0), device=logits.device)
         think_nce = nn.CrossEntropyLoss()(logits, labels)
         if torch.isnan(think_nce) or torch.isinf(think_nce):
-            print("[WARNING] think_nce is NaN/Inf, replacing with 0.0")
+            _warn_throttled('think_nce_nan', "[WARNING] think_nce is NaN/Inf, replacing with 0.0")
             think_nce = zero
         loss = loss + tlw * think_nce
 
