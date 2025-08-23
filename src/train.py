@@ -126,8 +126,32 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     max_t = None if max_t is None or max_t < 0 else int(max_t)
 
     steps_available = len(steps_data)
-    # 在不改动数据管线的前提下，cap 不能超过提供的 steps；若 max_t 为 None 则使用 steps_available
-    cap = min(steps_available, max_t) if max_t is not None else steps_available
+    # 计算应运行的内部步数：至少满足 min_t，至多不超过 max_t（若配置）
+    steps_to_run = steps_available
+    if min_t is not None:
+        steps_to_run = max(steps_to_run, min_t)
+    if max_t is not None:
+        steps_to_run = min(steps_to_run, max_t)
+    # 安全上限（硬性强制输出步）：不改变循环上界，仅在命中该步时强制输出
+    safety_max_t = getattr(config, 'SAFETY_MAX_THINKING_STEPS', None)
+    try:
+        safety_max_t = int(safety_max_t) if (safety_max_t is not None and int(safety_max_t) > 0) else None
+    except Exception:
+        safety_max_t = None
+    # 规范化 safety_max_t：若与 [min_t, max_t] 不一致，则裁剪并提示
+    try:
+        adj = False
+        if safety_max_t is not None:
+            if min_t is not None and safety_max_t < min_t:
+                safety_max_t = min_t; adj = True
+            if max_t is not None and safety_max_t > max_t:
+                safety_max_t = max_t; adj = True
+        if adj:
+            print(f"[info] SAFETY_MAX_THINKING_STEPS 已调整为 {safety_max_t} 以满足区间 [{min_t},{max_t}] 内")
+    except Exception:
+        pass
+    # 归一化分母采用计划运行的步数，以便 t_norm/remain_norm 与真实循环一致
+    cap = steps_to_run
 
     # 评估用“样本级目标”（例如最终答案）：取该样本在本batch内最后一个非空 target 作为全局标签，用于在每个思考步评估 token_ce（不参与反传）
     final_target_padded = None
@@ -154,8 +178,19 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     collect_detail = bool(getattr(config, 'COLLECT_DETAIL_FOR_DEBUG', True))
     detail_trace = [] if collect_detail else None
 
-    for t in range(steps_available):
-        x_t_padded, target_padded, gate_target = steps_data[t]
+    for t in range(steps_to_run):
+        is_safety_step = (safety_max_t is not None and (t + 1) == safety_max_t)
+        # 若超过数据提供的步数，则补“思考步”（无输入、无监督）
+        if t < steps_available:
+            x_t_padded, target_padded, gate_target = steps_data[t]
+        else:
+            x_t_padded, target_padded = None, None
+            # gate_target 置 0（不要求发声）
+            gate_target = torch.zeros(batch_size, dtype=torch.float32, device=DEVICE)
+        # 若命中安全步且无 target，则强制作为“发声步”：使用最终目标作为监督
+        if is_safety_step and target_padded is None and final_target_padded is not None:
+            target_padded = final_target_padded
+            gate_target = torch.ones(batch_size, dtype=torch.float32, device=DEVICE)
         x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
         gate_target = gate_target.to(DEVICE, non_blocking=True)
         if target_padded is not None:
@@ -210,7 +245,12 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             )
 
             # 统计门控均值/熵（gate_pred 为 logits，这里按概率统计）
-            gate_prob = torch.sigmoid(gate_pred)
+            # 数值保护 + 温度平滑（日志统计用，不影响反传）
+            gate_logits = torch.nan_to_num(gate_pred, nan=0.0, posinf=10.0, neginf=-10.0)
+            gp_temp = float(getattr(config, 'GATE_PROB_LOG_TEMPERATURE', 1.0) or 1.0)
+            if gp_temp != 1.0 and gp_temp > 0:
+                gate_logits = gate_logits / gp_temp
+            gate_prob = torch.sigmoid(gate_logits)
             gate_mean_acc += float(gate_prob.mean().item())
             p = torch.clamp(gate_prob, 1e-6, 1 - 1e-6)
             gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
@@ -480,6 +520,23 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
         total_batch_loss += step_loss.item()
         h_prev = h_next.detach()
         steps_updated += 1
+
+        # 可选：达到最小步后，基于门控阈值提前停止多步思考；若命中安全步（并已强制输出）则直接终止
+        try:
+            if is_safety_step:
+                break
+            if getattr(config, 'USE_GATED_MULTISTEP', False) and (min_t is None or (t + 1) >= min_t):
+                th = float(getattr(config, 'GATE_THRESHOLD', 0.5) or 0.5)
+                # 早停阈值加动态偏移：越接近MAX越容易触发
+                dyn_eps = float(getattr(config, 'GATE_DYNAMIC_THRESHOLD_EPS', 0.1) or 0.0)
+                if dyn_eps != 0 and cap > 0:
+                    t_frac = (t + 1) / cap
+                    th = max(0.0, min(1.0, th - dyn_eps * t_frac))
+                gate_prob_mean = float(torch.sigmoid(gate_pred).mean().item()) if gate_pred is not None else 0.0
+                if gate_prob_mean >= th:
+                    break
+        except Exception:
+            pass
 
         # 基于门控的多步思考早停（需达到最小思考步才生效）
     # 循环结束后，如仍有未更新的累积梯度则执行一次优化器更新

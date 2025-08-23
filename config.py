@@ -123,8 +123,8 @@ THINKING_STEPS = 5
 
 
 # 新增：自适应思考步数（-1 表示不限制；训练/推理时可运行时覆盖）
-MIN_THINKING_STEPS = 5
-MAX_THINKING_STEPS = 8
+MIN_THINKING_STEPS = 10
+MAX_THINKING_STEPS = -1
 # 安全兜底，防止极端情况下长时间不发声
 SAFETY_MAX_THINKING_STEPS = 64
 
@@ -149,6 +149,8 @@ INNER_STEP_LR_DECAY = 0.95
 INITIAL_TEMPERATURE = 1.5
 TEMPERATURE_DECAY = 0.95
 MIN_TEMPERATURE = 0.2
+# 训练单元最小温度下限（ReservoirRNNCell 内部 clamp），避免软/硬采样数值不稳
+CELL_MIN_TAU = 1e-3
 
 # 强化“思考表征”的学习（优化4）
 THINK_LOSS_WEIGHT = 0.1  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
@@ -224,6 +226,13 @@ USE_CSV_LOGGER = True
 CSV_LOG_PATH = "./logs/train_metrics.csv"
 # CSV 列扩展（分项指标）将自动写入：token_ce、gate_bce、think_nce
 
+# 详细报告输出去向（为避免刷屏可只落盘摘要）
+DETAIL_LOG_TO_CONSOLE = True
+DETAIL_LOG_TO_FILE = True
+
+# 数值异常警告节流（每N次才打印一次）
+NUMERIC_WARNINGS_EVERY_N = 200
+
 # 调试开关：打印 token_ce 相关诊断（默认关闭，避免刷屏）
 DEBUG_TOKEN_CE = False
 DEBUG_TOKEN_CE_EVERY_N = 1000  # 每训练多少“对话样本”打印一次调试摘要（而非按内部步）。设为0关闭。
@@ -263,6 +272,16 @@ BEST_MODEL_DIR = "./best_model"
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
 GATE_THRESHOLD = 0.7
 
+# 动态早停阈值的时间偏移：阈值随 t 增长略降，靠近 MAX 更易触发（0 关闭）
+GATE_DYNAMIC_THRESHOLD_EPS = 0.0
+
+# 门控 logits 归一化与温度（抑制饱和导致 gate_p 清一色 0/1）
+GATE_LOGIT_NORM = True           # 对门控 logits 应用 LayerNorm(1)
+GATE_LOGIT_TEMPERATURE = 1.5     # >1 更保守，<1 更激进（作用在 logits 上）
+
+# 日志统计时的门控温度（仅影响监控打印，不影响训练反传）
+GATE_PROB_LOG_TEMPERATURE = 1.0
+
 # USE_SOFT_TOPK_TRAINING: 训练时静态头是否使用“近似可微 Top‑k”来替换硬采样，利于学习采样权重。
 USE_SOFT_TOPK_TRAINING = True
 # 是否使用基于上下文的随机采样评分器（增强版采样器）
@@ -297,6 +316,12 @@ USE_DYNAMIC_FEEDBACK = True
 FEEDBACK_EMBED_DIM = 32  # 小投影维度，避免干扰主干
 
 THINK_TRACE_TOPK = 5
+
+# 基于“时间进度”的门控偏置（满足：t<MIN 抑制发声；t>=MIN 后随 t_norm 递增，越靠近 MAX 越“想说”）
+GATE_TIME_BIAS_ENABLE = True
+GATE_TIME_BIAS_STRENGTH = 2.0    # 偏置强度（作用在 logits 上）
+GATE_TIME_BIAS_GAMMA = 2.0       # 递增曲线幂指数（>1 末端更陡）
+GATE_TIME_BIAS_MIN_WEIGHT = 1.0  # 达到最小步后的瞬时抬升权重
 
 
 # 是否启用序列级 CE（开启后模型返回 (B, L, V) 并对每个 token 计算CE）

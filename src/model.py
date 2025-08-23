@@ -516,8 +516,10 @@ class StaticHead(nn.Module):
             nn.Linear(concatenated_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),  # 新增：防止过拟合
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1),
         )  # 输出为logits，损失中使用 BCEWithLogitsLoss
+        # 门控logits归一化，避免过大：可选 LayerNorm
+        self.gate_norm = nn.LayerNorm(1, elementwise_affine=False)
 
         # 2. 输出网络
         self.output_network = nn.Sequential(
@@ -603,6 +605,11 @@ class StaticHead(nn.Module):
         combined_input = torch.cat((sampled_state, attn_context), dim=1)
 
         gate_signal = self.gate_network(combined_input)
+        try:
+            if getattr(config, 'GATE_LOGIT_NORM', True):
+                gate_signal = self.gate_norm(gate_signal)
+        except Exception:
+            pass
         output_logits = self.output_network(combined_input)
 
         return gate_signal, output_logits
@@ -691,6 +698,13 @@ class HGD_MemNet(nn.Module):
 
         # 4. 将新的隐藏状态和动态上下文向量输入到静态决策头
         gate_pred, output_logits = self.static_head(h_next, attn_context)
+        # 可选：门控logits温度，降低饱和（>1 更保守）
+        try:
+            g_temp = float(getattr(config, 'GATE_LOGIT_TEMPERATURE', 1.0) or 1.0)
+            if g_temp > 0 and g_temp != 1.0:
+                gate_pred = gate_pred / g_temp
+        except Exception:
+            pass
 
         # 4.1 若启用序列级 CE，则用简单 GRU 解码器进行 Teacher-Forcing，输出 (B, L, V)
         seq_logits = None
@@ -700,9 +714,27 @@ class HGD_MemNet(nn.Module):
             dec_out, _ = self.seq_decoder(x_t_embedded, dec_h0)  # (B, L, H)
             seq_logits = self.seq_out(dec_out)         # (B, L, V)
 
-        # 5. 可选：使用控制向量对门控进行无参数微调（不破坏可导性）
+        # 5. 可选：基于时间进度的门控“时间偏置”与微调
+        #  - 目标：t < MIN 时抑制发声，t >= MIN 后随时间递增，加速靠近 MAX 时的发声倾向
         if control is not None:
             try:
+                # control = [t_norm, remain_norm, min_done, budget]
+                t_norm = control[:, 0:1]
+                min_done_flag = control[:, 2:3]
+                # 时间偏置（作用在 logits 上）：bias = strength * (min_weight*(min_done-0.5) + (t_norm^gamma))
+                if getattr(config, 'GATE_TIME_BIAS_ENABLE', True):
+                    strength = float(getattr(config, 'GATE_TIME_BIAS_STRENGTH', 2.0) or 0.0)
+                    gamma = float(getattr(config, 'GATE_TIME_BIAS_GAMMA', 2.0) or 1.0)
+                    min_weight = float(getattr(config, 'GATE_TIME_BIAS_MIN_WEIGHT', 1.0) or 0.0)
+                    if strength != 0.0:
+                        p = torch.clamp(torch.nan_to_num(t_norm, nan=0.0), 0.0, 1.0)
+                        md = torch.clamp(torch.nan_to_num(min_done_flag, nan=0.0), 0.0, 1.0)
+                        time_term = torch.pow(p, gamma)
+                        min_term = (md - 0.5) * min_weight
+                        bias = strength * (time_term + min_term)
+                        gate_pred = gate_pred + bias
+
+                # 兼容旧的概率级微调（可选）
                 alpha = getattr(config, 'CONTROL_GATE_ALPHA', 0.0)
                 if alpha and alpha > 0:
                     c = torch.sigmoid(torch.nan_to_num(control, nan=0.0))
