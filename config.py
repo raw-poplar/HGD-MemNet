@@ -113,10 +113,8 @@ if LOW_MEMORY_MODE:
 
 
 # --- 其他训练参数 ---
-# THINKING_STEPS: 为每个对话轮设计的“内部思考步数”。
-#   - 数据预处理阶段会为每个目标轮生成若干“思考步”（gate=0）和一个“输出步”（gate=1）；
-#   - 训练时可搭配 USE_GATED_MULTISTEP 早停，模拟“思考到位即输出”。
-THINKING_STEPS = 5
+# THINKING_STEPS: 固定思考步（已不推荐）。设为 0 表示不注入固定思考步，由 MIN/MAX_THINKING_STEPS 与门控决定。
+THINKING_STEPS = 0
 
 # 说明：若使用自适应思考（MIN/MAX_THINKING_STEPS），THINKING_STEPS 作为数据侧“思考步的最大规划参考”，
 # 实际训练中是否提前/延后由门控与 MIN/MAX 决定。
@@ -158,7 +156,7 @@ MIN_TEMPERATURE = 0.2
 CELL_MIN_TAU = 1e-3
 
 # 强化“思考表征”的学习（优化4）
-THINK_LOSS_WEIGHT = 0.1  # 由 0.0 提升，观察 token_ce 走势；可线性 warmup
+THINK_LOSS_WEIGHT = 0.05  # 轻量自监督（InfoNCE），更像“思考表征”约束
 
 # ------------------------------------
 # 注意力机制相关参数
@@ -243,7 +241,7 @@ DEBUG_TOKEN_CE = False
 DEBUG_TOKEN_CE_EVERY_N = 1000  # 每训练多少“对话样本”打印一次调试摘要（而非按内部步）。设为0关闭。
 
 # 语言 CE 的 label smoothing 系数（0 表示关闭）；建议 0.05 起步
-LABEL_SMOOTHING = 0.05
+LABEL_SMOOTHING = 0.0
 
 # THINK_LOSS warmup 步数（0 表示关闭）。建议设为若干验证间隔的总步数，如 5*VALIDATE_EVERY_N_STEPS
 # 注意：需在 VALIDATE_EVERY_N_STEPS 定义之后设置；此处仅占位，真正值在下方定义
@@ -288,10 +286,10 @@ TEST_NUM_WORKERS = STREAM_DATALOADER_NUM_WORKERS
 #   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
 #   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
-GATE_THRESHOLD = 0.625
+GATE_THRESHOLD = 0.80
 
 # 动态早停阈值的时间偏移：阈值随 t 增长略降，靠近 MAX 更易触发（0 关闭）
-GATE_DYNAMIC_THRESHOLD_EPS = 0.0
+GATE_DYNAMIC_THRESHOLD_EPS = 0.05
 
 # 门控 logits 归一化与温度（抑制饱和导致 gate_p 清一色 0/1）
 GATE_LOGIT_NORM = False          # 单通道 LayerNorm(1) 会退化为0，导致后续仅剩时间偏置；默认关闭
@@ -324,10 +322,17 @@ PRINT_DETAIL_EVERY_N_STEPS = 500
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
 # 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
-THINK_STEP_CE_WEIGHT = 0.8
+THINK_STEP_CE_WEIGHT = 0.0
 THINK_STEP_CE_WARMUP_STEPS = 0
 # 加权方案："t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
 THINK_STEP_CE_SCHEME = "t_norm"
+
+# 思考步蒸馏（弱反馈）：将思考步分布轻量拉向发声/序列解码器的软目标
+# 0 表示关闭
+THOUGHT_DISTILL_WEIGHT = 0.3
+THOUGHT_DISTILL_WARMUP_STEPS = 0
+THOUGHT_DISTILL_SCHEME = "t_norm"   # 't_norm' 或 'gate_prob'
+THOUGHT_DISTILL_TAU = 1.0            # 蒸馏温度
 
 # 动态反馈（将阈值与上一步门控/输出摘要喂回动态组，t+1步使用）
 USE_DYNAMIC_FEEDBACK = True

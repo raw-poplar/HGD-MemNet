@@ -204,8 +204,8 @@ def process_dialogue_to_tensors(dialogue_list, vocab):
             x_ref_tensor = _to_ids(x_ref_text)
             for i in range(1, len(dialogue_list)):
                 target_text = dialogue_list[i].get("text", "")
-                # 思考步骤 (THINKING_STEPS 次)
-                for _ in range(config.THINKING_STEPS):
+                # 思考步骤 (THINKING_STEPS 次；若未定义则视为0)
+                for _ in range(int(getattr(config, 'THINKING_STEPS', 0) or 0)):
                     steps_data.append((None, torch.tensor([], dtype=torch.long), torch.tensor([0.0], dtype=torch.float)))
                 # 输出步骤
                 x_t_text = dialogue_list[i-1].get("text", "")

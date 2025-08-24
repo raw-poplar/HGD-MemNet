@@ -416,6 +416,51 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                         comps_acc['token_ce_eval'] = comps_acc.get('token_ce_eval', 0.0) + eval_comps.get('token_ce', 0.0)
             except Exception:
                 pass
+
+            # 思考步蒸馏（弱反馈）：将思考步的分布拉向基于“最终目标序列”的软 teacher 分布（不直接用 gold 做硬CE）
+            try:
+                distill_w = float(getattr(config, 'THOUGHT_DISTILL_WEIGHT', 0.0) or 0.0)
+                if distill_w > 0 and output_logits is not None and final_target_padded is not None and target_padded is None:
+                    import torch.nn.functional as F
+                    # 构造 teacher：用序列解码器在最终目标序列上跑一次 TF，初态用当前 h_next（表示“思考到此时”为止的内部状态）
+                    teacher_p = None
+                    try:
+                        if getattr(model, 'use_sequence_ce', False) and hasattr(model, 'seq_decoder') and hasattr(model, 'seq_out'):
+                            with torch.no_grad():
+                                dec_inp = model.embed(final_target_padded)
+                                dec_h0 = h_next.unsqueeze(0)
+                                dec_out, _ = model.seq_decoder(dec_inp, dec_h0)  # (B,L,H)
+                                seq_logits = model.seq_out(dec_out)              # (B,L,V)
+                                # 使用“非PAD且非EOS”的时间步做掩码平均，避免末位偏向 EOS
+                                tau = float(getattr(config, 'THOUGHT_DISTILL_TAU', 1.0) or 1.0)
+                                probs = F.softmax(seq_logits / max(tau, 1e-6), dim=-1)  # (B,L,V)
+                                valid_mask = (final_target_padded != getattr(config, 'PAD_token', 0)) & (final_target_padded != getattr(config, 'EOS_token', 2))
+                                if valid_mask.any():
+                                    weights = valid_mask.float()  # (B,L)
+                                    weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+                                    teacher_p = (probs * weights.unsqueeze(-1)).sum(dim=1).detach()  # (B,V)
+                                else:
+                                    # 兜底：取中间位置
+                                    mid = max(0, probs.size(1) // 2)
+                                    teacher_p = probs[:, mid, :].detach()
+                    except Exception:
+                        teacher_p = None
+                    if teacher_p is not None:
+                        tau = float(getattr(config, 'THOUGHT_DISTILL_TAU', 1.0) or 1.0)
+                        student_logits = output_logits[:, -1, :] if output_logits.dim() == 3 else output_logits
+                        if student_logits.size(-1) == teacher_p.size(-1):
+                            student_logp = F.log_softmax(student_logits / max(tau, 1e-6), dim=-1)
+                            kl = F.kl_div(student_logp, teacher_p, reduction='batchmean')
+                            scheme = str(getattr(config, 'THOUGHT_DISTILL_SCHEME', 't_norm') or 't_norm').lower()
+                            if scheme == 't_norm':
+                                w_scalar = float(((t + 1) / max(cap, 1)))
+                            elif scheme == 'gate_prob':
+                                w_scalar = float(torch.sigmoid(gate_pred.detach()).mean().item())
+                            else:
+                                w_scalar = 1.0
+                            step_loss = step_loss + distill_w * w_scalar * kl
+            except Exception:
+                pass
             # 思考步弱监督 token_ce（小权重+warmup+可选加权方案）
             try:
                 # 辅助 CE 触发检查（仅调试）
@@ -1357,7 +1402,7 @@ def train_model():
                                             topk_fmt = ''
                                             try:
                                                 if topk:
-                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.6f}" for i, p in topk])
                                             except Exception:
                                                 pass
                                             lines.append(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
@@ -1496,7 +1541,7 @@ def train_model():
                                             topk_fmt = ''
                                             try:
                                                 if topk:
-                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                                    topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.6f}" for i, p in topk])
                                             except Exception:
                                                 pass
                                             print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
@@ -1635,7 +1680,7 @@ def train_model():
                                     topk_fmt = ''
                                     try:
                                         if topk:
-                                            topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.3f}" for i, p in topk])
+                                            topk_fmt = ', '.join([f"{vocab.index2word.get(i, f'<UNK:{i}>')}:{p:.6f}" for i, p in topk])
                                     except Exception:
                                         pass
                                     print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
