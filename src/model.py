@@ -662,7 +662,7 @@ class HGD_MemNet(nn.Module):
             self.seq_decoder = nn.GRU(embed_dim, dynamic_hidden_dim, batch_first=True)
             self.seq_out = nn.Linear(dynamic_hidden_dim, vocab_size)
 
-    def forward(self, x_t, x_ref, h_prev, temperature=None, control=None, feedback_vec=None):
+    def forward(self, x_t, x_ref, h_prev, temperature=None, control=None, feedback_vec=None, x_ref_encoded=None, x_ref_mask=None):
         """
         一次完整的思考步骤
 
@@ -682,14 +682,17 @@ class HGD_MemNet(nn.Module):
         # 1. 嵌入输入
         # 如果 x_t 存在，进行嵌入；否则为 None
         x_t_embedded = self.embed(x_t) if x_t is not None else None
-        x_ref_embedded = self.embed(x_ref)
-
-        # 1.1 构建 padding 掩码：True=有效，False=padding
-        x_ref_mask = (x_ref != config.PAD_token) if x_ref is not None else None
-
-        # 2. 编码参照输入 x_ref 来为注意力机制和上下文向量做准备
-        # encoder_outputs shape: (batch_size, ref_seq_len, dynamic_hidden_dim)
-        encoder_outputs, _ = self.dynamic_group.encoder_rnn(x_ref_embedded)
+        if x_ref_encoded is None:
+            # 正常路径：需要嵌入并编码 x_ref
+            x_ref_embedded = self.embed(x_ref)
+            # 1.1 构建 padding 掩码：True=有效，False=padding
+            x_ref_mask = (x_ref != config.PAD_token) if x_ref is not None else None
+            # 2. 编码参照输入 x_ref 来为注意力机制和上下文向量做准备
+            # encoder_outputs shape: (batch_size, ref_seq_len, dynamic_hidden_dim)
+            encoder_outputs, _ = self.dynamic_group.encoder_rnn(x_ref_embedded)
+        else:
+            # 复用外部预编码结果（典型用于验证/测试加速）
+            encoder_outputs = x_ref_encoded
 
         # 3. 通过动态组进行一步演化（可选传入反馈）
         h_next, attn_context = self.dynamic_group(
@@ -720,6 +723,7 @@ class HGD_MemNet(nn.Module):
             try:
                 # control = [t_norm, remain_norm, min_done, budget]
                 t_norm = control[:, 0:1]
+                remain_norm = control[:, 1:2]
                 min_done_flag = control[:, 2:3]
                 # 时间偏置（作用在 logits 上）：bias = strength * (min_weight*(min_done-0.5) + (t_norm^gamma))
                 if getattr(config, 'GATE_TIME_BIAS_ENABLE', True):
@@ -733,6 +737,71 @@ class HGD_MemNet(nn.Module):
                         min_term = (md - 0.5) * min_weight
                         bias = strength * (time_term + min_term)
                         gate_pred = gate_pred + bias
+                        # 偏置加入后对 logits 做幅度裁剪，避免数值饱和到 0/1 概率
+                        try:
+                            clamp_v = float(getattr(config, 'GATE_POST_BIAS_CLAMP', 0.0) or 0.0)
+                            if clamp_v and clamp_v > 0:
+                                gate_pred = torch.clamp(gate_pred, -clamp_v, clamp_v)
+                        except Exception:
+                            pass
+
+                # 额外：Sigmoid 型时间引导（将 gate 概率往目标时间曲线做凸组合）
+                try:
+                    guide_alpha = float(getattr(config, 'GATE_TIME_GUIDE_ALPHA', 0.0) or 0.0)
+                    if guide_alpha > 0:
+                        # 计算当前归一化步位置 p，并构建分段 sigmoid 目标曲线
+                        # p_min: MIN/denom, p_max: MAX/denom, p_safe: SAFETY/denom
+                        denom = torch.clamp(remain_norm + t_norm, min=1e-6)  # 之前构造的 denom: cap+extra
+                        p = torch.clamp(t_norm, 0.0, 1.0)
+                        # 标量配置
+                        k1 = float(getattr(config, 'GATE_PRE_MIN_K', 6.0))
+                        k2 = float(getattr(config, 'GATE_MID_K', 12.0))
+                        k3 = float(getattr(config, 'GATE_POST_MAX_K', 6.0))
+                        mid_lo = float(getattr(config, 'GATE_MID_LOW', 0.1))
+                        mid_hi = float(getattr(config, 'GATE_MID_HIGH', 0.8))
+                        MIN_T = float(getattr(config, 'MIN_THINKING_STEPS', 0) or 0)
+                        MAX_T = float(getattr(config, 'MAX_THINKING_STEPS', 0) or 0)
+                        SAFE_T = float(getattr(config, 'SAFETY_MAX_THINKING_STEPS', 0) or 0)
+                        # 将阈值映射到 [0,1] 空间，避免除0
+                        p_min = torch.clamp(torch.tensor(MIN_T, device=gate_pred.device) / torch.tensor((MAX_T if MAX_T>0 else MIN_T)+ (getattr(config,'GATE_TIME_RAMP_EXTRA_STEPS',0) or 0), device=gate_pred.device).clamp(min=1.0), 0.0, 1.0)
+                        p_max = torch.clamp(torch.tensor(MAX_T if MAX_T>0 else MIN_T, device=gate_pred.device) / torch.tensor((MAX_T if MAX_T>0 else MIN_T)+ (getattr(config,'GATE_TIME_RAMP_EXTRA_STEPS',0) or 0), device=gate_pred.device).clamp(min=1.0), 0.0, 1.0)
+                        p_safe = torch.clamp(torch.tensor(SAFE_T if SAFE_T>0 else MAX_T, device=gate_pred.device) / torch.tensor((MAX_T if MAX_T>0 else SAFE_T)+ (getattr(config,'GATE_TIME_RAMP_EXTRA_STEPS',0) or 0), device=gate_pred.device).clamp(min=1.0), 0.0, 1.0)
+
+                        def _sigmoid(x, k, x0):
+                            return 1.0 / (1.0 + torch.exp(-k * (x - x0)))
+
+                        # 三段式：
+                        # 1) [0, p_min): 缓慢上升到 mid_lo
+                        pre = mid_lo * _sigmoid(p, k1, p_min * 0.9)
+                        # 2) [p_min, p_max]: 快速从 mid_lo 上升到 mid_hi
+                        mid = mid_lo + (mid_hi - mid_lo) * _sigmoid(p, k2, (p_min + p_max) * 0.5)
+                        # 3) (p_max, p_safe]: 缓慢从 mid_hi 上升到 1.0
+                        post = mid_hi + (1.0 - mid_hi) * _sigmoid(p, k3, (p_max + p_safe) * 0.5)
+                        g_target = torch.where(p < p_min, pre, torch.where(p <= p_max, mid, post))
+                        # 安全步及以后目标为 1.0（作为引导）
+                        g_target = torch.where(p >= p_safe, torch.ones_like(g_target), g_target)
+                        # 将 gate_pred 的概率与目标做凸组合
+                        g_prob = torch.sigmoid(gate_pred)
+                        # 分段引导权重：MIN前弱引导，MIN~MAX 强引导，MAX~SAFETY 中等引导
+                        base = guide_alpha
+                        w_pre = base * float(getattr(config, 'GATE_GUIDE_ALPHA_PRE', 0.5))
+                        w_mid = base * float(getattr(config, 'GATE_GUIDE_ALPHA_MID', 1.0))
+                        w_post = base * float(getattr(config, 'GATE_GUIDE_ALPHA_POST', 0.6))
+                        w = torch.where(p < p_min, torch.full_like(g_prob, w_pre), torch.where(p <= p_max, torch.full_like(g_prob, w_mid), torch.full_like(g_prob, w_post)))
+                        g_prob = (1 - w) * g_prob + w * g_target
+                        # 回到 logits 空间（数值安全）
+                        g_prob = torch.clamp(g_prob, 1e-6, 1 - 1e-6)
+                        gate_pred = torch.log(g_prob) - torch.log1p(-g_prob)
+
+                        # 安全兜底：到达 SAFETY_MAX_THINKING_STEPS 时将 logits 直接推到大正值，确保 gate_p≈1
+                        try:
+                            force_logit = float(getattr(config, 'GATE_SAFETY_FORCE_LOGIT', 0.0) or 0.0)
+                            if force_logit > 0:
+                                gate_pred = torch.where(p >= p_safe, torch.full_like(gate_pred, force_logit), gate_pred)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
                 # 兼容旧的概率级微调（可选）
                 alpha = getattr(config, 'CONTROL_GATE_ALPHA', 0.0)

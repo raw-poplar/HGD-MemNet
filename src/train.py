@@ -132,26 +132,20 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
         steps_to_run = max(steps_to_run, min_t)
     if max_t is not None:
         steps_to_run = min(steps_to_run, max_t)
+    # 若启用扩展，则当数据步不足时补空思考直至 MAX
+    if getattr(config, 'EXTEND_THINKING_TO_MAX', False) and (max_t is not None):
+        steps_to_run = max(steps_to_run, max_t)
     # 安全上限（硬性强制输出步）：不改变循环上界，仅在命中该步时强制输出
     safety_max_t = getattr(config, 'SAFETY_MAX_THINKING_STEPS', None)
     try:
         safety_max_t = int(safety_max_t) if (safety_max_t is not None and int(safety_max_t) > 0) else None
     except Exception:
         safety_max_t = None
-    # 规范化 safety_max_t：若与 [min_t, max_t] 不一致，则裁剪并提示
-    try:
-        adj = False
-        if safety_max_t is not None:
-            if min_t is not None and safety_max_t < min_t:
-                safety_max_t = min_t; adj = True
-            if max_t is not None and safety_max_t > max_t:
-                safety_max_t = max_t; adj = True
-        if adj:
-            print(f"[info] SAFETY_MAX_THINKING_STEPS 已调整为 {safety_max_t} 以满足区间 [{min_t},{max_t}] 内")
-    except Exception:
-        pass
-    # 归一化分母采用计划运行的步数，以便 t_norm/remain_norm 与真实循环一致
+    # 不再自动裁剪或提示 SAFETY_MAX_THINKING_STEPS，严格按配置使用
+    # 归一化分母采用计划运行的步数；若允许延长至安全步，则以安全步作为 cap
     cap = steps_to_run
+    if getattr(config, 'EXTEND_THINKING_TO_SAFETY', False) and (safety_max_t is not None):
+        cap = max(cap, safety_max_t)
 
     # 评估用“样本级目标”（例如最终答案）：取该样本在本batch内最后一个非空 target 作为全局标签，用于在每个思考步评估 token_ce（不参与反传）
     final_target_padded = None
@@ -178,21 +172,20 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
     collect_detail = bool(getattr(config, 'COLLECT_DETAIL_FOR_DEBUG', True))
     detail_trace = [] if collect_detail else None
 
-    for t in range(steps_to_run):
+    # 循环上界：若启用延长至安全步，则延长到 safety
+    loop_steps = cap if (getattr(config, 'EXTEND_THINKING_TO_SAFETY', False) and (safety_max_t is not None)) else steps_to_run
+    for t in range(loop_steps):
         is_safety_step = (safety_max_t is not None and (t + 1) == safety_max_t)
         # 若超过数据提供的步数，则补“思考步”（无输入、无监督）
         if t < steps_available:
-            x_t_padded, target_padded, gate_target = steps_data[t]
+            # 忽略数据集中的 gate 标签
+            x_t_padded, target_padded, _ = steps_data[t]
         else:
             x_t_padded, target_padded = None, None
-            # gate_target 置 0（不要求发声）
-            gate_target = torch.zeros(batch_size, dtype=torch.float32, device=DEVICE)
         # 若命中安全步且无 target，则强制作为“发声步”：使用最终目标作为监督
         if is_safety_step and target_padded is None and final_target_padded is not None:
             target_padded = final_target_padded
-            gate_target = torch.ones(batch_size, dtype=torch.float32, device=DEVICE)
         x_t_padded = x_t_padded.to(DEVICE, non_blocking=True) if x_t_padded is not None else None
-        gate_target = gate_target.to(DEVICE, non_blocking=True)
         if target_padded is not None:
             target_padded = target_padded.to(DEVICE, non_blocking=True)
 
@@ -208,8 +201,11 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
 
         with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
             # 构造控制向量（时机意识）：t_norm, remain_norm, min_done, target_speak_ratio
-            t_norm = torch.full((batch_size, 1), (t + 1) / max(cap, 1), device=DEVICE)
-            remain_norm = torch.full((batch_size, 1), max(cap - (t + 1), 0) / max(cap, 1), device=DEVICE)
+            # 缓升：将分母扩大 extra，使 MIN_THINKING_STEPS 处的 t_norm < 1，减缓时间偏置增长
+            extra = float(getattr(config, 'GATE_TIME_RAMP_EXTRA_STEPS', 0) or 0)
+            denom = max(cap + extra, 1)
+            t_norm = torch.full((batch_size, 1), (t + 1) / denom, device=DEVICE)
+            remain_norm = torch.full((batch_size, 1), max(denom - (t + 1), 0) / denom, device=DEVICE)
             min_done = torch.full((batch_size, 1), 1.0 if (min_t is not None and (t + 1) >= min_t) or (min_t is None) else 0.0, device=DEVICE)
             budget = torch.full((batch_size, 1), float(getattr(config, 'TARGET_SPEAK_RATIO', 0.0) or 0.0), device=DEVICE)
             control = torch.cat([t_norm, remain_norm, min_done, budget], dim=1)
@@ -270,8 +266,24 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             else:
                 tlw_eff = tlw_cfg
 
+            # ========== 基于门控与安全步的“发声决策”与监督选择 ==========
+            th_now = float(getattr(config, 'GATE_THRESHOLD', 0.5) or 0.5)
+            dyn_eps = float(getattr(config, 'GATE_DYNAMIC_THRESHOLD_EPS', 0.0) or 0.0)
+            if dyn_eps != 0 and cap > 0:
+                th_now = max(0.0, min(1.0, th_now - dyn_eps * ((t + 1) / cap)))
+            gate_prob_mean_now = float(torch.sigmoid(gate_pred).mean().item()) if gate_pred is not None else 0.0
+            min_done_now = (min_t is None) or ((t + 1) >= min_t)
+            decided_to_speak = (is_safety_step or (min_done_now and (gate_prob_mean_now >= th_now)))
+            # 若到达 MAX 仍未触发，则在 MAX 强制发声（符合“在 MIN~MAX 区间内发声”的要求）
+            if (not decided_to_speak) and (max_t is not None) and ((t + 1) == max_t):
+                decided_to_speak = True
+
+            # 若无 target 且决定发声，使用最终目标监督；并将 gate_target 置为 1
+            y_for_loss = target_padded
+            if y_for_loss is None and decided_to_speak and final_target_padded is not None:
+                y_for_loss = final_target_padded
             step_loss, comps = compute_loss(
-                gate_pred, gate_target, output_logits, target_padded,
+                gate_pred, None, output_logits, y_for_loss,
                 gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                 target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                 h_prev=h_prev, h_next=h_next,
@@ -351,8 +363,8 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                                 pass
                     except Exception:
                         pass
-                    # 记录该步是否有 target（作为“发声步”）
-                    rec['is_speak_step'] = bool(target_padded is not None)
+                    # 记录该步是否“发声”：由门控/安全步或数据标签触发
+                    rec['is_speak_step'] = bool(decided_to_speak)
                     detail_trace.append(rec)
             except Exception:
                 pass
@@ -525,6 +537,9 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
         try:
             if is_safety_step:
                 break
+            # 到达 MAX 后也结束该样本（无论门控情况），以确保在 MIN~MAX 区间内发声一次
+            if (max_t is not None) and ((t + 1) == max_t):
+                break
             if getattr(config, 'USE_GATED_MULTISTEP', False) and (min_t is None or (t + 1) >= min_t):
                 th = float(getattr(config, 'GATE_THRESHOLD', 0.5) or 0.5)
                 # 早停阈值加动态偏移：越接近MAX越容易触发
@@ -534,7 +549,9 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                     th = max(0.0, min(1.0, th - dyn_eps * t_frac))
                 gate_prob_mean = float(torch.sigmoid(gate_pred).mean().item()) if gate_pred is not None else 0.0
                 if gate_prob_mean >= th:
-                    break
+                    # 若允许延长到安全步并尚未达到安全步，则不早停
+                    if not (getattr(config, 'EXTEND_THINKING_TO_SAFETY', False) and (safety_max_t is not None) and ((t + 1) < safety_max_t)):
+                        break
         except Exception:
             pass
 
@@ -738,7 +755,7 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
     sample_size = int(getattr(config, 'VALIDATE_SAMPLE_SIZE', 0) or 0)
     shuffle_when_subsample = bool(getattr(config, 'VALIDATE_SHUFFLE_WHEN_SUBSAMPLE', True))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         # 验证阶段使用硬采样
         model.dynamic_group.core_rnn.use_hard_sampling = True
 
@@ -759,31 +776,37 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
                             chunk_data = chunk_data[:remaining]
 
                         val_dataset = _ChunkListDataset(chunk_data)
-                        # 注意：在部分 Windows + CUDA 环境下，pin_memory + non_blocking 组合可能触发底层 CUDAEvent 错误
-                        # 因此验证/测试阶段一律关闭 pin_memory，以提高稳定性（对速度影响可忽略）
+                        # 注意：pin_memory/num_workers 可通过配置控制
                         val_loader = DataLoader(
                             val_dataset,
-                            batch_size=config.BATCH_SIZE,
+                            batch_size=getattr(config, 'VAL_BATCH_SIZE', config.BATCH_SIZE),
                             collate_fn=binary_collate_fn,
-                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            num_workers=getattr(config, 'VALIDATE_NUM_WORKERS', getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0)),
                             shuffle=False,
-                            pin_memory=False,
+                            pin_memory=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False)),
                         )
                         pbar = tqdm(val_loader, desc=f"正在验证 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            # 验证阶段禁用非阻塞拷贝，避免触发 CUDAEvent::record 相关崩溃
-                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False)))
+                            # 预编码 x_ref 并复用到每个内部步
+                            with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                                x_ref_emb = model.embed(x_ref_padded)
+                                x_ref_mask = (x_ref_padded != config.PAD_token)
+                                x_ref_encoded, _ = model.dynamic_group.encoder_rnn(x_ref_emb)
                             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-                            for x_t, y_t, g_t in steps_data:
-                                x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
-                                y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
-                                g_t = g_t.to(DEVICE, non_blocking=False)
+                            for x_t, y_t, _ in steps_data:
+                                x_t = x_t.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False))) if x_t is not None else None
+                                y_t = y_t.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False))) if y_t is not None else None
 
-                                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+                                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                                    h_next, gate_pred, output_logits = model(
+                                        x_t, x_ref_padded, h_prev, temperature=0.1,
+                                        x_ref_encoded=x_ref_encoded, x_ref_mask=x_ref_mask
+                                    )
 
                                 step_loss, comps = compute_loss(
-                                    gate_pred, g_t, output_logits, y_t,
+                                    gate_pred, None, output_logits, y_t,
                                     gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                                     target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                                     return_components=True,
@@ -827,28 +850,35 @@ def validate_model(model, epoch=None, optimizer=None, csv_writer=None):
 
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=config.BATCH_SIZE,
+                batch_size=getattr(config, 'VAL_BATCH_SIZE', config.BATCH_SIZE),
                 collate_fn=binary_collate_fn,
-                num_workers=min(os.cpu_count(), 2),
-                pin_memory=False,
+                num_workers=getattr(config, 'VALIDATE_NUM_WORKERS', min(os.cpu_count(), 2)),
+                pin_memory=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False)),
                 persistent_workers=True,
                 prefetch_factor=2,
                 shuffle=False,
             )
             pbar = tqdm(val_loader, desc="正在验证")
             for x_ref_padded, steps_data in pbar:
-                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False)))
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    x_ref_emb = model.embed(x_ref_padded)
+                    x_ref_mask = (x_ref_padded != config.PAD_token)
+                    x_ref_encoded, _ = model.dynamic_group.encoder_rnn(x_ref_emb)
                 h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-                for x_t, y_t, g_t in steps_data:
-                    x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
-                    y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
-                    g_t = g_t.to(DEVICE, non_blocking=False)
+                for x_t, y_t, _ in steps_data:
+                    x_t = x_t.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False))) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=bool(getattr(config, 'VALIDATE_PIN_MEMORY', False))) if y_t is not None else None
 
-                    h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+                    with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                        h_next, gate_pred, output_logits = model(
+                            x_t, x_ref_padded, h_prev, temperature=0.1,
+                            x_ref_encoded=x_ref_encoded, x_ref_mask=x_ref_mask
+                        )
 
                     step_loss = compute_loss(
-                        gate_pred, g_t, output_logits, y_t,
+                        gate_pred, None, output_logits, y_t,
                         gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                         target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                     )
@@ -875,7 +905,7 @@ def test_model(model):
     total_test_loss = 0.0
     total_steps = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         model.dynamic_group.core_rnn.use_hard_sampling = True
 
         if getattr(config, 'USE_STREAMING_TEST', True):
@@ -885,26 +915,33 @@ def test_model(model):
                         test_dataset = _ChunkListDataset(chunk_data)
                         test_loader = DataLoader(
                             test_dataset,
-                            batch_size=config.BATCH_SIZE,
+                            batch_size=getattr(config, 'TEST_BATCH_SIZE', getattr(config, 'VAL_BATCH_SIZE', config.BATCH_SIZE)),
                             collate_fn=binary_collate_fn,
-                            num_workers=getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0),
+                            num_workers=getattr(config, 'TEST_NUM_WORKERS', getattr(config, 'STREAM_DATALOADER_NUM_WORKERS', 0)),
                             shuffle=False,
-                            pin_memory=False,
+                            pin_memory=bool(getattr(config, 'TEST_PIN_MEMORY', False)),
                         )
                         pbar = tqdm(test_loader, desc=f"正在测试 | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
+                            x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False)))
+                            with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                                x_ref_emb = model.embed(x_ref_padded)
+                                x_ref_mask = (x_ref_padded != config.PAD_token)
+                                x_ref_encoded, _ = model.dynamic_group.encoder_rnn(x_ref_emb)
                             h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-                            for x_t, y_t, g_t in steps_data:
-                                x_t = x_t.to(DEVICE, non_blocking=True) if x_t is not None else None
-                                y_t = y_t.to(DEVICE, non_blocking=True) if y_t is not None else None
-                                g_t = g_t.to(DEVICE, non_blocking=True)
+                            for x_t, y_t, _ in steps_data:
+                                x_t = x_t.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False))) if x_t is not None else None
+                                y_t = y_t.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False))) if y_t is not None else None
 
-                                h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+                                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                                    h_next, gate_pred, output_logits = model(
+                                        x_t, x_ref_padded, h_prev, temperature=0.1,
+                                        x_ref_encoded=x_ref_encoded, x_ref_mask=x_ref_mask
+                                    )
 
                                 step_loss, comps = compute_loss(
-                                    gate_pred, g_t, output_logits, y_t,
+                                    gate_pred, None, output_logits, y_t,
                                     gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                                     target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                                     return_components=True,
@@ -928,28 +965,35 @@ def test_model(model):
 
             test_loader = DataLoader(
                 test_dataset,
-                batch_size=config.BATCH_SIZE,
+                batch_size=getattr(config, 'TEST_BATCH_SIZE', getattr(config, 'VAL_BATCH_SIZE', config.BATCH_SIZE)),
                 collate_fn=binary_collate_fn,
-                num_workers=min(os.cpu_count(), 2),
-                pin_memory=False,
+                num_workers=getattr(config, 'TEST_NUM_WORKERS', min(os.cpu_count(), 2)),
+                pin_memory=bool(getattr(config, 'TEST_PIN_MEMORY', False)),
                 persistent_workers=True,
                 prefetch_factor=2,
                 shuffle=False,
             )
             pbar = tqdm(test_loader, desc="正在测试")
             for x_ref_padded, steps_data in pbar:
-                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=False)
+                x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False)))
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    x_ref_emb = model.embed(x_ref_padded)
+                    x_ref_mask = (x_ref_padded != config.PAD_token)
+                    x_ref_encoded, _ = model.dynamic_group.encoder_rnn(x_ref_emb)
                 h_prev = torch.zeros(x_ref_padded.size(0), config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
 
-                for x_t, y_t, g_t in steps_data:
-                    x_t = x_t.to(DEVICE, non_blocking=False) if x_t is not None else None
-                    y_t = y_t.to(DEVICE, non_blocking=False) if y_t is not None else None
-                    g_t = g_t.to(DEVICE, non_blocking=False)
+                for x_t, y_t, _ in steps_data:
+                    x_t = x_t.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False))) if x_t is not None else None
+                    y_t = y_t.to(DEVICE, non_blocking=bool(getattr(config, 'TEST_PIN_MEMORY', False))) if y_t is not None else None
 
-                    h_next, gate_pred, output_logits = model(x_t, x_ref_padded, h_prev, temperature=0.1)
+                    with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                        h_next, gate_pred, output_logits = model(
+                            x_t, x_ref_padded, h_prev, temperature=0.1,
+                            x_ref_encoded=x_ref_encoded, x_ref_mask=x_ref_mask
+                        )
 
                     step_loss = compute_loss(
-                        gate_pred, g_t, output_logits, y_t,
+                        gate_pred, None, output_logits, y_t,
                         gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
                         target_speak_ratio=getattr(config, 'TARGET_SPEAK_RATIO', None),
                     )
@@ -1065,6 +1109,12 @@ def train_model():
         vocab_path = os.path.join(config.LCCC_PROCESSED_PATH, "vocabulary.json")
         with open(vocab_path, 'r', encoding='utf-8') as f:
             vocab_dict = json.load(f)
+        # 修正：JSON 会将数值键序列化为字符串，需将 index2word 的键转为 int，避免日志解码成 <UNK:*>
+        try:
+            if isinstance(vocab_dict.get('index2word'), dict):
+                vocab_dict['index2word'] = {int(k): v for k, v in vocab_dict['index2word'].items()}
+        except Exception:
+            pass
         vocab = Vocabulary("lccc")
         vocab.__dict__.update(vocab_dict)
         config.VOCAB_SIZE = vocab.num_words

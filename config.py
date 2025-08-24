@@ -97,7 +97,7 @@ UNK_token = 3  # 未知词
 # BATCH_SIZE: 逻辑批大小（非等效）。
 #   - 实际每次反向传播等效批次 ≈ BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS；
 #   - 小显存推荐减小 BATCH_SIZE 并增大 GRADIENT_ACCUMULATION_STEPS。
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 
 # GRADIENT_ACCUMULATION_STEPS: 梯度累积步数。
 #   - 例如 BATCH_SIZE=4, ACCUMULATION=12，则等效批次≈48；
@@ -123,10 +123,15 @@ THINKING_STEPS = 5
 
 
 # 新增：自适应思考步数（-1 表示不限制；训练/推理时可运行时覆盖）
-MIN_THINKING_STEPS = 10
-MAX_THINKING_STEPS = -1
+MIN_THINKING_STEPS = 8
+MAX_THINKING_STEPS = 24
 # 安全兜底，防止极端情况下长时间不发声
-SAFETY_MAX_THINKING_STEPS = 64
+SAFETY_MAX_THINKING_STEPS = 32
+
+# 当样本提供的步数不足时，是否自动补“空思考步”直至 MAX_THINKING_STEPS
+EXTEND_THINKING_TO_MAX = True
+# 若希望在未发声时继续思考至安全步（优先级高于上项）
+EXTEND_THINKING_TO_SAFETY = False
 
 # 优化器/调度（优化2）：AdamW + ReduceLROnPlateau
 OPTIMIZER = "adamw"          # "adam" / "adamw"
@@ -249,10 +254,12 @@ THINK_WARMUP_STEPS = None
 # 验证与模型保存
 # ------------------------------------
 # VALIDATE_EVERY_N_STEPS: 每 N 个“内部步”后在验证集上评估一次（频繁会减慢训练）。
-VALIDATE_EVERY_N_STEPS = 2000
+VALIDATE_EVERY_N_STEPS = 5000
 # 可选：验证时仅抽样固定数量的对话（0 表示禁用抽样，使用全量）。
 VALIDATE_SAMPLE_SIZE = 1000           # 示例：设为 1000 可大幅缩短验证时间
 VALIDATE_SHUFFLE_WHEN_SUBSAMPLE = True  # 抽样时是否打乱验证集顺序
+# 预热：在训练开始时预先加载若干验证 chunks 到内存，减少“开始验证前”的首次IO等待
+VALIDATE_WARMUP_CHUNKS = 2            # 0 表示不预热；建议 1-3
 
 # THINK_LOSS warmup 步数的实际值（默认 5 次验证间隔）
 if THINK_WARMUP_STEPS is None:
@@ -260,6 +267,17 @@ if THINK_WARMUP_STEPS is None:
 
 # BEST_MODEL_DIR: 保存验证集最优模型权重的目录。
 BEST_MODEL_DIR = "./best_model"
+
+# 验证/测试性能相关配置
+# - VAL_BATCH_SIZE/TEST_BATCH_SIZE: 可单独设置为训练批大小的 1-2 倍以提升吞吐（注意显存）
+# - VALIDATE_PIN_MEMORY/TEST_PIN_MEMORY: 若环境稳定可尝试开启以加速 H2D 拷贝
+# - VALIDATE_NUM_WORKERS/TEST_NUM_WORKERS: Windows 下建议 0；若 CPU 解码重且稳定可尝试 1-2
+VAL_BATCH_SIZE = BATCH_SIZE
+TEST_BATCH_SIZE = VAL_BATCH_SIZE
+VALIDATE_PIN_MEMORY = False
+TEST_PIN_MEMORY = False
+VALIDATE_NUM_WORKERS = STREAM_DATALOADER_NUM_WORKERS  # 默认与流式一致
+TEST_NUM_WORKERS = STREAM_DATALOADER_NUM_WORKERS
 
 
 # ------------------------------------
@@ -270,14 +288,14 @@ BEST_MODEL_DIR = "./best_model"
 #   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
 #   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
-GATE_THRESHOLD = 0.7
+GATE_THRESHOLD = 0.625
 
 # 动态早停阈值的时间偏移：阈值随 t 增长略降，靠近 MAX 更易触发（0 关闭）
 GATE_DYNAMIC_THRESHOLD_EPS = 0.0
 
 # 门控 logits 归一化与温度（抑制饱和导致 gate_p 清一色 0/1）
-GATE_LOGIT_NORM = True           # 对门控 logits 应用 LayerNorm(1)
-GATE_LOGIT_TEMPERATURE = 1.5     # >1 更保守，<1 更激进（作用在 logits 上）
+GATE_LOGIT_NORM = False          # 单通道 LayerNorm(1) 会退化为0，导致后续仅剩时间偏置；默认关闭
+GATE_LOGIT_TEMPERATURE = 1.0     # >1 更保守，<1 更激进（作用在 logits 上）
 
 # 日志统计时的门控温度（仅影响监控打印，不影响训练反传）
 GATE_PROB_LOG_TEMPERATURE = 1.0
@@ -302,14 +320,14 @@ THINK_INFO_TAU = 0.15
 # 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
 CONTROL_GATE_ALPHA = 0.0
 # 控制台详细打印频率（每N个“内部总步”打印一行详细分项，0表示关闭）
-PRINT_DETAIL_EVERY_N_STEPS = 200
+PRINT_DETAIL_EVERY_N_STEPS = 500
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
 # 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
-THINK_STEP_CE_WEIGHT = 0.5
+THINK_STEP_CE_WEIGHT = 0.8
 THINK_STEP_CE_WARMUP_STEPS = 0
 # 加权方案："t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
-THINK_STEP_CE_SCHEME = "gate_prob"
+THINK_STEP_CE_SCHEME = "t_norm"
 
 # 动态反馈（将阈值与上一步门控/输出摘要喂回动态组，t+1步使用）
 USE_DYNAMIC_FEEDBACK = True
@@ -318,10 +336,26 @@ FEEDBACK_EMBED_DIM = 32  # 小投影维度，避免干扰主干
 THINK_TRACE_TOPK = 5
 
 # 基于“时间进度”的门控偏置（满足：t<MIN 抑制发声；t>=MIN 后随 t_norm 递增，越靠近 MAX 越“想说”）
-GATE_TIME_BIAS_ENABLE = True
-GATE_TIME_BIAS_STRENGTH = 2.0    # 偏置强度（作用在 logits 上）
-GATE_TIME_BIAS_GAMMA = 2.0       # 递增曲线幂指数（>1 末端更陡）
-GATE_TIME_BIAS_MIN_WEIGHT = 1.0  # 达到最小步后的瞬时抬升权重
+GATE_TIME_BIAS_ENABLE = False
+GATE_TIME_BIAS_STRENGTH = 1.5    # 偏置强度（作用在 logits 上）
+GATE_TIME_BIAS_GAMMA = 4.0       # 递增曲线幂指数（>1 末端更陡）
+GATE_TIME_BIAS_MIN_WEIGHT = 0.0  # 取消在达到最小步时的瞬时抬升，避免 gate_p 突然跳变
+GATE_POST_BIAS_CLAMP = 4.0       # 时间偏置加入后对 gate logits 进行幅度裁剪，避免饱和
+
+# 为时间偏置提供额外“缓升”步数（仅影响 t_norm 的分母，使 MIN 处的 t_norm<1，便于平滑）
+GATE_TIME_RAMP_EXTRA_STEPS = 4
+
+# Sigmoid 型时间引导配置（将 gate_p 引导为目标曲线后与学习到的 logits 融合）
+GATE_TIME_GUIDE_ALPHA = 0.6      # 0 关闭；数值越大越贴合目标曲线（建议 0.6~0.9 for 强引导）
+GATE_GUIDE_ALPHA_PRE = 0.8       # MIN 前的引导权重系数（相对 base alpha）
+GATE_GUIDE_ALPHA_MID = 2.0       # MIN~MAX 区间的引导权重系数
+GATE_GUIDE_ALPHA_POST = 0.8      # MAX~SAFETY 区间的引导权重系数
+GATE_PRE_MIN_K = 8.0             # MIN 之前的缓升坡度（越小越慢；5~8）
+GATE_MID_K = 16.0                # MIN~MAX 区间的快升坡度（越大越快；10~16）
+GATE_POST_MAX_K = 6.0            # MAX 之后的缓升坡度（越小越慢；5~8）
+GATE_MID_LOW = 0.5               # 进入 MIN 时的目标下界（接近 0）
+GATE_MID_HIGH = 0.85              # 到达 MAX 时的目标上界（<1，留空间给安全步）
+GATE_SAFETY_FORCE_LOGIT = 8.0    # 在 SAFETY_MAX_THINKING_STEPS 处强制 gate logits 为大正值（≈1 概率）
 
 
 # 是否启用序列级 CE（开启后模型返回 (B, L, V) 并对每个 token 计算CE）
@@ -346,7 +380,7 @@ REGROW_INIT_STD = 1e-3         # 新生连接权重初始化标准差
 
 HEBB_EMA_BETA = 0.9            # 赫布分数的EMA系数（越大越平滑）
 
-USE_GATED_MULTISTEP = False
+USE_GATED_MULTISTEP = True
 
 
 # ------------------------------------
@@ -356,7 +390,7 @@ USE_GATED_MULTISTEP = False
 CHECKPOINT_DIR = "./checkpoints"
 
 # SAVE_CHECKPOINT_EVERY_N_BATCHES: 每处理多少个 batch（内部步聚合后的单位）保存一次检查点。
-SAVE_CHECKPOINT_EVERY_N_BATCHES = 1000
+SAVE_CHECKPOINT_EVERY_N_BATCHES = 10000
 
 # MAX_CHECKPOINTS_TO_KEEP: 最多保留的检查点个数（滚动删除旧的）。
 MAX_CHECKPOINTS_TO_KEEP = 5
