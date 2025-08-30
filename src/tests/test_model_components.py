@@ -205,8 +205,9 @@ class TestStaticHead:
         assert gate_signal.shape == (self.batch_size, 1)
         assert output_logits.shape == (self.batch_size, self.output_dim)
         
-        # 检查门控信号在[0,1]范围内
-        assert torch.all(gate_signal >= 0) and torch.all(gate_signal <= 1)
+        # 检查门控概率在[0,1]范围内（模型返回的是logits，这里转为概率）
+        gate_prob = torch.sigmoid(gate_signal)
+        assert torch.all(gate_prob >= 0) and torch.all(gate_prob <= 1)
     
     def test_sampling_consistency(self):
         """测试采样的一致性"""

@@ -39,7 +39,7 @@ def test_architecture_performance():
         embed_dim=config.EMBEDDING_DIM,
         dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
         static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
-        use_attention=True,
+        num_attention_heads=1,
     )
 
     # 性能测试
@@ -64,7 +64,7 @@ def test_architecture_performance():
         embed_dim=config.EMBEDDING_DIM,
         dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
         static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
-        use_attention=False,
+        num_attention_heads=0,
     )
 
     # 性能测试

@@ -34,7 +34,8 @@ class TestTrainingComponents:
     def test_compute_loss_function(self):
         """测试损失计算函数"""
         # 创建模拟输出
-        gate_pred = torch.sigmoid(torch.randn(self.batch_size, 1))
+        # compute_loss 期望 logits，这里直接提供 logits
+        gate_pred = torch.randn(self.batch_size, 1)
         gate_target = torch.randint(0, 2, (self.batch_size, 1)).float()
         output_logits = torch.randn(self.batch_size, TEST_VOCAB_SIZE)
         target_padded = torch.randint(0, TEST_VOCAB_SIZE, (self.batch_size,))
@@ -50,7 +51,7 @@ class TestTrainingComponents:
     
     def test_compute_loss_with_none_target(self):
         """测试处理None目标的损失计算"""
-        gate_pred = torch.sigmoid(torch.randn(self.batch_size, 1))
+        gate_pred = torch.randn(self.batch_size, 1)
         gate_target = torch.randint(0, 2, (self.batch_size, 1)).float()
         output_logits = torch.randn(self.batch_size, TEST_VOCAB_SIZE)
         

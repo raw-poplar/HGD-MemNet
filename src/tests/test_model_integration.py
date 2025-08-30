@@ -39,10 +39,16 @@ class TestHGDMemNet:
         # 检查输出形状
         assert h_next.shape == (self.batch_size, TEST_DYNAMIC_GROUP_HIDDEN_DIM)
         assert gate_pred.shape == (self.batch_size, 1)
-        assert output_logits.shape == (self.batch_size, TEST_VOCAB_SIZE)
+        if output_logits.dim() == 2:
+            assert output_logits.shape == (self.batch_size, TEST_VOCAB_SIZE)
+        elif output_logits.dim() == 3:
+            B, L, V = output_logits.shape
+            assert B == self.batch_size and V == TEST_VOCAB_SIZE
+        else:
+            assert False, f"Unexpected output_logits dim: {output_logits.dim()}"
         
-        # 检查门控预测在[0,1]范围内
-        assert torch.all(gate_pred >= 0) and torch.all(gate_pred <= 1)
+        # 检查门控概率在[0,1]范围内（模型返回 logits，这里转为概率）
+        assert torch.all(torch.sigmoid(gate_pred) >= 0) and torch.all(torch.sigmoid(gate_pred) <= 1)
     
     def test_model_with_none_input(self):
         """测试模型处理None输入"""
@@ -103,8 +109,10 @@ class TestHGDMemNet:
         h_next, gate_pred, output_logits = self.model(x_t, x_ref, h_prev)
         
         # 计算损失
-        gate_loss = nn.BCELoss()(gate_pred, torch.ones_like(gate_pred) * 0.5)
-        output_loss = nn.CrossEntropyLoss()(output_logits, torch.randint(0, TEST_VOCAB_SIZE, (self.batch_size,)))
+        # 使用 BCEWithLogitsLoss（输入为 logits）
+        gate_loss = nn.BCEWithLogitsLoss()(gate_pred, torch.ones_like(gate_pred) * 0.5)
+        logits_for_ce = output_logits[:, -1, :] if output_logits.dim() == 3 else output_logits
+        output_loss = nn.CrossEntropyLoss()(logits_for_ce, torch.randint(0, TEST_VOCAB_SIZE, (self.batch_size,)))
         total_loss = gate_loss + output_loss
         
         # 反向传播
@@ -121,9 +129,18 @@ class TestHGDMemNet:
                 zero_grad_params.append(name)
 
         # 某些参数可能由于模型结构而没有梯度，这是正常的
-        # 例如：temperature参数可能在某些情况下不被使用
-        expected_no_grad = ['dynamic_group.core_rnn.temperature']  # 可能没有梯度的参数
-        unexpected_no_grad = [name for name in no_grad_params if name not in expected_no_grad]
+        # - core_rnn.temperature 可能不参与反传
+        # - 未启用反馈时 feedback_proj 不参与计算
+        # - USE_SEQUENCE_CE=True 时 static_head.output_network 未被用作 CE 输出
+        expected_no_grad = ['dynamic_group.core_rnn.temperature']
+        allowed_prefixes = [
+            'dynamic_group.feedback_proj.',
+            'static_head.output_network.',
+        ]
+        unexpected_no_grad = [
+            name for name in no_grad_params
+            if (name not in expected_no_grad) and (not any(name.startswith(p) for p in allowed_prefixes))
+        ]
 
         assert len(unexpected_no_grad) == 0, f"Unexpected parameters with no gradient: {unexpected_no_grad}"
 

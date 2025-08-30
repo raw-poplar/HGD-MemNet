@@ -147,7 +147,8 @@ class MultiHeadAttention(nn.Module):
                 with torch.no_grad():
                     valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
                     safe = mask.float() / valid_counts
-                attn_weights = safe.unsqueeze(1)  # (B,1,L) -> 广播到 (B, num_heads, 1, L) 时将在 matmul 前使用
+                # 调整形状以匹配多头注意力所需的 (B, num_heads, 1, L)
+                attn_weights = safe.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, 1, -1)
             else:
                 attn_weights = torch.ones_like(attn_weights) / attn_weights.size(-1)
 
@@ -208,19 +209,24 @@ class ReservoirRNNCell(nn.Module):
     - 支持温度 τ（可学习或外部传入）控制探索-利用；
     - 在训练态以 EMA 方式积累 Hebbian 与使用频度统计，供剪枝/再生长策略使用。
     """
-    def __init__(self, input_size, hidden_size, initial_temperature=1.0, use_hard_sampling=False):
+    def __init__(self, input_size, hidden_size, initial_temperature=1.0, use_hard_sampling=False, async_groups=1, async_shuffle=False):
         """
         Args:
             input_size (int): 输入维度。
             hidden_size (int): 隐藏状态维度（神经元数量）。
             initial_temperature (float): 初始温度参数，控制采样随机性（>1: 更随机；<1: 更确定）。默认1.0。
             use_hard_sampling (bool): 是否在 forward 中使用硬采样。默认 False（训练建议软采样）。
+            async_groups (int): 异步更新的分组数（>1 启用分组异步：逐组更新隐藏状态）。默认 1（同步/Jacobi）。
+            async_shuffle (bool): 是否在每次前向时打乱分组更新顺序。默认 False（固定顺序）。
         """
         super(ReservoirRNNCell, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.temperature = nn.Parameter(torch.tensor(initial_temperature))  # 可学习温度（也可被 forward 参数覆盖）
         self.use_hard_sampling = use_hard_sampling
+        # 异步更新设置
+        self.async_groups = max(1, int(async_groups))
+        self.async_shuffle = bool(async_shuffle)
         self.W_ih = nn.Linear(input_size, hidden_size, bias=True)
         # 可训练的“隐藏-隐藏”权重矩阵：(hidden_out, hidden_in)，行表示从所有输入隐藏单元聚合到该输出单元的权重。
         self.W_hh_matrix = nn.Parameter(torch.empty(hidden_size, hidden_size))
@@ -279,15 +285,45 @@ class ReservoirRNNCell(nn.Module):
         except Exception:
             self.last_selection_stats = None
 
-        # 4) 聚合上一步隐藏状态：h_prev ∈ (B, H_in)
-        if self.hidden_size > 512:
-            contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)
+        # 4) 聚合隐藏状态并计算更新
+        # 同步（Jacobi）或分组异步（Gauss-Seidel）更新
+        if self.async_groups <= 1:
+            # 同步：基于上一时刻 h_prev 聚合
+            if self.hidden_size > 512:
+                contrib = torch.matmul(gumbel_samples, h_prev.unsqueeze(2)).squeeze(2)
+            else:
+                contrib = torch.einsum('boh,bh->bo', gumbel_samples, h_prev)
+            h_preact = input_contrib + contrib
+            h_next = torch.tanh(h_preact)
         else:
-            contrib = torch.einsum('boh,bh->bo', gumbel_samples, h_prev)
+            # 异步分组：逐组更新，后续组使用前面组的最新 h 值
+            batch_size = h_prev.size(0)
+            h_current = h_prev.clone()
+            # 构建分组索引
+            device = h_prev.device
+            all_idx = torch.arange(self.hidden_size, device=device)
+            if self.async_shuffle and self.training:
+                perm = torch.randperm(self.hidden_size, device=device)
+                all_idx = all_idx[perm]
+            groups = torch.chunk(all_idx, self.async_groups)
 
-        # 5) 激活得到 h_next，并积累 Hebbian 统计
-        h_preact = input_contrib + contrib
-        h_next = torch.tanh(h_preact)
+            # 逐组更新
+            for idx in groups:
+                if idx.numel() == 0:
+                    continue
+                # 取该组的选择权重与输入贡献
+                weights_g = gumbel_samples[:, idx, :]  # (B, g, H)
+                input_contrib_g = input_contrib[:, idx]  # (B, g)
+                # 使用最新 h_current 聚合
+                if self.hidden_size > 512:
+                    contrib_g = torch.matmul(weights_g, h_current.unsqueeze(2)).squeeze(2)
+                else:
+                    contrib_g = torch.einsum('bgh,bh->bg', weights_g, h_current)
+                preact_g = input_contrib_g + contrib_g  # (B, g)
+                h_next_g = torch.tanh(preact_g)
+                # 写回 h_current（提供给后续组）
+                h_current[:, idx] = h_next_g
+            h_next = h_current
 
         if self.training:
             with torch.no_grad():
@@ -518,8 +554,8 @@ class StaticHead(nn.Module):
             nn.Dropout(0.1),  # 新增：防止过拟合
             nn.Linear(hidden_dim, 1),
         )  # 输出为logits，损失中使用 BCEWithLogitsLoss
-        # 门控logits归一化，避免过大：可选 LayerNorm
-        self.gate_norm = nn.LayerNorm(1, elementwise_affine=False)
+        # 门控logits归一化，避免对单通道做无意义归一化
+        self.gate_norm = nn.Identity()
 
         # 2. 输出网络
         self.output_network = nn.Sequential(
