@@ -4,6 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init  # 新增 for xavier
 import config
+from src.modules.context import Attention, MultiHeadAttention, AttentionFactory, get_context_provider
+from src.architectures.neurons import CompositeReservoirCell
+try:
+    import src.arch_config as arch_config
+except Exception:
+    arch_config = None
 
 """
 模块概览：HGD-MemNet 主要组件
@@ -19,186 +25,6 @@ import config
 """
 
 
-# --- 注意力模块 ---
-class Attention(nn.Module):
-    """
-    标准的 Bahdanau 注意力机制
-    - 输入：
-    - query: (B, H) 当前步的查询（通常是上一步隐藏状态 h_prev）
-    - keys:  (B, L, H) 编码器输出序列（作为注意力的 key/value）
-    - mask:  (B, L) 可选，True 表示有效 token，False 表示 padding；若提供将避免将 padding 纳入 softmax
-    - 输出：
-    - context: (B, H) 按注意力权重加权后的上下文向量
-    - attn_weights: (B, L) 每个时间步的注意力分布
-    """
-    def __init__(self, hidden_dim):
-        super(Attention, self).__init__()
-        self.Wa = nn.Linear(hidden_dim, hidden_dim)
-        self.Ua = nn.Linear(hidden_dim, hidden_dim)
-        self.Va = nn.Linear(hidden_dim, 1)
-
-    def forward(self, query, keys, mask=None):
-        """
-        Args:
-            query (torch.Tensor): 上一步的解码器隐藏状态 (h_prev), shape: (batch_size, hidden_dim)
-            keys (torch.Tensor): 编码器的所有输出 (x_ref_encoded), shape: (batch_size, seq_len, hidden_dim)
-            mask (torch.BoolTensor, optional): 有效位置为 True 的 padding 掩码，shape: (batch_size, seq_len)
-
-        Returns:
-            context (torch.Tensor): 上下文向量, shape: (batch_size, hidden_dim)
-            attn_weights (torch.Tensor): 注意力权重, shape: (batch_size, seq_len)
-        """
-        # query shape: (batch_size, 1, hidden_dim)
-        # keys shape: (batch_size, seq_len, hidden_dim)
-        scores = self.Va(torch.tanh(self.Wa(query.unsqueeze(1)) + self.Ua(keys)))
-        scores = scores.squeeze(2)  # (batch_size, seq_len)
-
-        if mask is not None:
-            # 将被mask的位置设为 -inf，softmax 后权重为0
-            scores = scores.masked_fill(~mask, float('-inf'))
-
-        # 数值稳定性处理：softmax 前后均做保护
-        attn_weights = F.softmax(scores, dim=1)
-
-        # 若出现 NaN/Inf（如整行均为 padding），回退到安全分布
-        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
-            if mask is not None:
-                # 对每个样本，若有效位置和为0，则使用均匀分布；否则按mask均匀分布
-                with torch.no_grad():
-                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                    safe = mask.float() / valid_counts
-                attn_weights = safe
-            else:
-                attn_weights = torch.ones_like(scores) / max(1, scores.size(1))
-
-        # context shape: (batch_size, 1, hidden_dim)
-        context = torch.bmm(attn_weights.unsqueeze(1), keys)
-        context = context.squeeze(1)  # (batch_size, hidden_dim)
-
-        return context, attn_weights
-
-
-# --- 多头注意力模块 ---
-class MultiHeadAttention(nn.Module):
-    """
-    多头注意力机制（单步 query, 序列 keys）
-    - 输入：query: (B, H)、keys: (B, L, H)、mask: (B, L)
-    - 实现：标准缩放点积注意力 + 残差 + LayerNorm；支持温度与 dropout。
-    - 输出：context: (B, H)，attn_weights: (B, num_heads, L)
-    """
-    def __init__(self, hidden_dim, num_heads, dropout=0.1, use_bias=True, temperature=1.0):
-        super(MultiHeadAttention, self).__init__()
-        assert hidden_dim % num_heads == 0, f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
-
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.temperature = temperature
-
-        # 线性投影层
-        self.W_q = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
-        self.W_k = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
-        self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
-        self.W_o = nn.Linear(hidden_dim, hidden_dim, bias=use_bias)
-
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, query, keys, mask=None):
-        """
-        Args:
-            query (torch.Tensor): shape: (batch_size, hidden_dim)
-            keys (torch.Tensor): shape: (batch_size, seq_len, hidden_dim)
-            mask (torch.BoolTensor, optional): 有效位置为 True 的 padding 掩码，shape: (batch_size, seq_len)
-
-        Returns:
-            context (torch.Tensor): shape: (batch_size, hidden_dim)
-            attn_weights (torch.Tensor): shape: (batch_size, num_heads, seq_len)
-        """
-        batch_size, seq_len, _ = keys.shape
-
-        # 扩展query维度以匹配keys
-        query = query.unsqueeze(1)  # (batch_size, 1, hidden_dim)
-
-        # 线性投影
-        Q = self.W_q(query)  # (batch_size, 1, hidden_dim)
-        K = self.W_k(keys)   # (batch_size, seq_len, hidden_dim)
-        V = self.W_v(keys)   # (batch_size, seq_len, hidden_dim)
-
-        # 重塑为多头格式
-        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, 1, head_dim)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
-
-        # 计算注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5 * max(float(self.temperature), 1e-6))  # (batch_size, num_heads, 1, seq_len)
-
-        if mask is not None:
-            # 扩展 mask 以匹配多头形状: (B, 1, 1, L)
-            mask_exp = mask.unsqueeze(1).unsqueeze(1)  # bool
-            scores = scores.masked_fill(~mask_exp, float('-inf'))
-
-        # 数值稳定性：softmax 之前处理掩码
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # 检查并修复NaN或无效值
-        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
-            if mask is not None:
-                with torch.no_grad():
-                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                    safe = mask.float() / valid_counts
-                # 调整形状以匹配多头注意力所需的 (B, num_heads, 1, L)
-                attn_weights = safe.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, 1, -1)
-            else:
-                attn_weights = torch.ones_like(attn_weights) / attn_weights.size(-1)
-
-        attn_weights = self.dropout(attn_weights)
-
-        # 应用注意力权重
-        context = torch.matmul(attn_weights, V)  # (batch_size, num_heads, 1, head_dim)
-
-        # 合并多头
-        context = context.transpose(1, 2).contiguous().view(batch_size, 1, self.hidden_dim)  # (batch_size, 1, hidden_dim)
-        context = context.squeeze(1)  # (batch_size, hidden_dim)
-
-        # 输出投影
-        context = self.W_o(context)
-
-        # 残差连接和层归一化
-        context = self.layer_norm(context + query.squeeze(1))
-
-        return context, attn_weights.squeeze(2)  # (batch_size, hidden_dim), (batch_size, num_heads, seq_len)
-
-
-# --- 灵活的注意力工厂 ---
-class AttentionFactory:
-    """
-    注意力机制工厂类，根据配置创建不同类型的注意力机制
-    """
-    @staticmethod
-    def create_attention(hidden_dim, num_heads=1, attention_type="bahdanau", **kwargs):
-        """
-        创建注意力机制
-
-        Args:
-            hidden_dim: 隐藏层维度
-            num_heads: 注意力头数量 (0: 无注意力, 1: 单头, >=2: 多头)
-            attention_type: 注意力类型
-            **kwargs: 其他参数
-
-        Returns:
-            注意力模块或None
-        """
-        if num_heads == 0:
-            return None
-        elif num_heads == 1:
-            if attention_type == "bahdanau":
-                return Attention(hidden_dim)
-            else:
-                # 单头也可以使用多头注意力实现
-                return MultiHeadAttention(hidden_dim, 1, **kwargs)
-        else:
-            return MultiHeadAttention(hidden_dim, num_heads, **kwargs)
 
 
 # --- 新: 可训练的“蓄水池”式RNN单元 ---
@@ -439,8 +265,12 @@ class DynamicGroup(nn.Module):
             )
             core_input_size += getattr(config, 'FEEDBACK_EMBED_DIM', 32)
 
-        # 核心演化RNN: 被替换为新的可训练“蓄水池”单元
-        self.core_rnn = ReservoirRNNCell(core_input_size, hidden_dim)
+        # 核心演化RNN: 支持组合式可插拔内核（默认沿用 tanh 等价行为）
+        try:
+            neuron_plan = arch_config.resolve_neuron_plan(hidden_size=hidden_dim) if arch_config is not None else None
+        except Exception:
+            neuron_plan = None
+        self.core_rnn = CompositeReservoirCell(core_input_size, hidden_dim, neuron_plan=neuron_plan)
 
         self.norm = nn.LayerNorm(hidden_dim)  # 新增：LayerNorm for RNN输出
 

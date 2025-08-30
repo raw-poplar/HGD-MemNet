@@ -24,6 +24,10 @@ from .utils import _WARN_COUNTS  # 引入节流计数（仅用于统计/复用�
 import logging  # 新增：日志记录
 import gc
 from concurrent.futures import ThreadPoolExecutor
+try:
+    from . import arch_config as _arch_cfg
+except Exception:
+    _arch_cfg = None
 
 # 线程/队列（内存流式）
 import threading
@@ -72,8 +76,6 @@ def _extract_final_target_from_steps(steps_data, sample_idx: int = 0):
     except Exception:
         return None
 
-    cudnn.benchmark = False
-    cudnn.deterministic = True
 
 def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps: int = 0):
     """
@@ -1170,20 +1172,35 @@ def train_model():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+        # 使用 arch_config.CONTEXT 中的 heads/type（若存在），与新模块化上下文保持一致
+        heads = None
+        attn_type = None
+        try:
+            if _arch_cfg is not None and hasattr(_arch_cfg, 'CONTEXT'):
+                heads = int(_arch_cfg.CONTEXT.get('heads', config.NUM_ATTENTION_HEADS))
+                attn_type = str(_arch_cfg.CONTEXT.get('type', config.ATTENTION_TYPE))
+        except Exception:
+            heads = None
+            attn_type = None
+        if heads is None:
+            heads = config.NUM_ATTENTION_HEADS
+        if attn_type is None:
+            attn_type = config.ATTENTION_TYPE
+
         model = HGD_MemNet(
             vocab_size=config.VOCAB_SIZE, embed_dim=config.EMBEDDING_DIM,
             dynamic_hidden_dim=config.DYNAMIC_GROUP_HIDDEN_DIM,
             static_hidden_dim=config.STATIC_HEAD_HIDDEN_DIM,
-            num_attention_heads=config.NUM_ATTENTION_HEADS
+            num_attention_heads=heads
         ).to(DEVICE)
 
         # 打印模型架构信息
-        if config.NUM_ATTENTION_HEADS == 0:
+        if heads == 0:
             print("模型架构: 纯HGD-MemNet (无注意力机制)")
-        elif config.NUM_ATTENTION_HEADS == 1:
-            print(f"模型架构: HGD-MemNet + 单头注意力 ({config.ATTENTION_TYPE})")
+        elif heads == 1:
+            print(f"模型架构: HGD-MemNet + 单头注意力 ({attn_type})")
         else:
-            print(f"模型架构: HGD-MemNet + {config.NUM_ATTENTION_HEADS}头注意力 ({config.ATTENTION_TYPE})")
+            print(f"模型架构: HGD-MemNet + {heads}头注意力 ({attn_type})")
 
         # 新增：训练时设置软采样
         model.dynamic_group.core_rnn.use_hard_sampling = False

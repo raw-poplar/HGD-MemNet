@@ -125,6 +125,55 @@ graph TB
 ## 项目结构
 
 ```
+
+## 新的模块化扩展（上下文与神经元架构）
+
+- 上下文/注意力模块接口：`src/modules/context.py`
+  - 统一接口：`BaseContextProvider(query, keys, mask) -> (context, aux)`
+  - 已实现：`Attention`（Bahdanau）、`MultiHeadAttention`、`AvgPoolContext`、`NoContext`
+  - 工厂：`AttentionFactory` 与 `get_context_provider`
+  - 兼容性：`from src.model import Attention` 仍可用（内部重定向至模块实现）
+
+- 神经元架构接口与组合细胞：`src/architectures/neurons.py`
+  - 统一接口：`BaseNeuronKernel.forward(preact, h_prev, x_in=None)`
+  - 已实现内核：
+    - `TanhKernel`（等价原单元）
+    - `GRU1Kernel`（轻量逐通道门控）
+    - `LeakyIntegratorKernel`（漏斗整合）
+  - 组合细胞：`CompositeReservoirCell(input_size, hidden_size, neuron_plan=...)`
+    - 保留 Gumbel-Softmax 连接选择、剪枝与再生长
+    - 仅替换逐通道的非线性/更新公式，支持在同一隐藏向量内混合多种内核
+
+- 架构配置：`src/arch_config.py`
+  - `CONTEXT`：控制上下文类型与参数（与 `config.py` 默认保持一致）
+  - `NEURON_PLAN`：按 `count` 或 `ratio` 指定各内核占用的神经元数量
+  - `resolve_neuron_plan(hidden_size)`：将 `ratio` 解析为 `count`，保证总数等于隐藏维度
+
+### 如何新增一种神经元内核
+
+1. 在 `src/architectures/neurons.py` 中新增类并注册：
+
+```python
+@register_neuron("mykernel")
+class MyKernel(BaseNeuronKernel):
+    def __init__(self, dim: int, **kwargs):
+        super().__init__(dim)
+        # 定义必要参数
+    def forward(self, preact, h_prev, x_in=None):
+        # 返回 (B, dim)
+        return some_update
+```
+
+2. 在 `src/arch_config.py` 中配置使用比例或数量：
+
+```python
+NEURON_PLAN = [
+  {"type": "tanh", "ratio": 0.7},
+  {"type": "mykernel", "ratio": 0.3, "params": {"alpha": 0.2}},
+]
+```
+
+模型启动时会自动装配相应比例的神经元类型进入动态神经组中。
 HGD-MemNet/
 ├── .gitignore
 ├── LICENSE
@@ -711,6 +760,9 @@ current_temperature = max(initial_temperature * (temperature_decay ** t), config
 - pytest -q src/tests/test_multiprocessing_performance.py
 - pytest -q src/tests/test_performance.py
 - pytest -q src/tests/test_quick_performance.py
+
+新增：测试所有已实现神经元架构：
+- pytest -q src/tests/test_neuron_architectures.py
 
 需要完整运行时：
 - pytest -q src/tests

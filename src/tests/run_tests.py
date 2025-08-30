@@ -24,6 +24,7 @@ def run_unit_tests():
     
     test_files = [
         "test_model_components.py",
+        "test_neuron_architectures.py",
         "test_data_processing.py"
     ]
     
