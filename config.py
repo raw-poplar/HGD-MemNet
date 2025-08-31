@@ -126,6 +126,17 @@ MAX_THINKING_STEPS = 24
 # 安全兜底，防止极端情况下长时间不发声
 SAFETY_MAX_THINKING_STEPS = 32
 
+# 训练模式："stepwise"（现有的逐步思考/可能早停）或 "burst_ar"（先集中思考，再连续输出自回归）
+TRAIN_MODE = "burst_ar"  # 可改为 "burst_ar" 启用先深度思考后连续输出的训练
+
+# Burst AR 模式专属参数（先思考，再连续输出）
+# - BURST_SEQ_LOSS_WEIGHT: 句子级（Teacher-Forcing）CE 的权重（在逐 token CE 之外叠加）
+# - BURST_GATE_TARGET: 说话期希望的 gate 概率目标（0~1，用于设置控制向量引导，不是硬约束）
+# - BURST_BATCH_SIZE: 建议在该模式下先用 batch=1 简化实现
+BURST_SEQ_LOSS_WEIGHT = 0.5
+BURST_GATE_TARGET = 0.85
+BURST_BATCH_SIZE = 1
+
 # 当样本提供的步数不足时，是否自动补“空思考步”直至 MAX_THINKING_STEPS
 EXTEND_THINKING_TO_MAX = True
 # 若希望在未发声时继续思考至安全步（优先级高于上项）
@@ -232,6 +243,8 @@ CSV_LOG_PATH = "./logs/train_metrics.csv"
 # 详细报告输出去向（为避免刷屏可只落盘摘要）
 DETAIL_LOG_TO_CONSOLE = True
 DETAIL_LOG_TO_FILE = True
+DETAIL_MAX_RECORDS = 64           # 详细日志每次最多打印的步记录；<=0 表示打印全部
+DETAIL_DUMP_JSON = True           # 是否同时输出完整 detail_trace 为 JSON 文件
 
 # 数值异常警告节流（每N次才打印一次）
 NUMERIC_WARNINGS_EVERY_N = 200
@@ -318,7 +331,7 @@ THINK_INFO_TAU = 0.15
 # 通过控制向量对门控进行无参数微调的强度（0 关闭；建议 <=0.2）
 CONTROL_GATE_ALPHA = 0.0
 # 控制台详细打印频率（每N个“内部总步”打印一行详细分项，0表示关闭）
-PRINT_DETAIL_EVERY_N_STEPS = 500
+PRINT_DETAIL_EVERY_N_STEPS = 200
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
 # 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
@@ -364,7 +377,8 @@ GATE_SAFETY_FORCE_LOGIT = 8.0    # 在 SAFETY_MAX_THINKING_STEPS 处强制 gate 
 
 
 # 是否启用序列级 CE（开启后模型返回 (B, L, V) 并对每个 token 计算CE）
-USE_SEQUENCE_CE = True
+# 单元测试期望 forward 输出 (B, V)，因此默认关闭；burst_ar 模式内部单独计算序列级 CE
+USE_SEQUENCE_CE = False
 
 
 # USE_GATED_MULTISTEP: 是否启用“门控多步思考”早停（训练循环中当 gate>=阈值时提前跳出该样本的内部步）。

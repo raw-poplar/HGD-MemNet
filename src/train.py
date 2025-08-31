@@ -643,6 +643,272 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
 
     return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap), comps_avg, detail_trace
 
+# ========== 新增：Burst AR 训练（先集中思考，再连续输出） ==========
+def train_batch_burst_ar(x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps: int = 0):
+    """
+    Burst 自回归训练：
+    - 对每个样本的每一对 (prev_utt -> target_utt)：
+      1) 先进行 MIN~MAX 思考步（x_t=None，仅推进隐藏态与上下文注意力）
+      2) 进入连续输出期：逐 token 进行单步预测与 CE（teacher-forcing：将 gold 前缀喂回）
+      3) 句子级 TF CE（可选权重叠加）
+
+    备注：本模式主要按样本逐一处理（建议 batch=1），以保持自回归循环的清晰性。
+    返回值含义同 train_batch_stepwise，便于上层复用统计与日志。
+    """
+    model.train()
+    x_ref_padded = x_ref_padded.to(DEVICE, non_blocking=True)
+
+    batch_size = x_ref_padded.size(0)
+    total_batch_loss = 0.0
+    steps_updated = 0
+    gate_mean_acc = 0.0
+    gate_entropy_acc = 0.0
+    gate_obs = 0
+    ended_by_cap = False
+
+    comps_acc = {
+        'gate_bce': 0.0,
+        'token_ce': 0.0,
+        'token_ce_eval': 0.0,
+        'gate_entropy_reg': 0.0,
+        'budget_reg': 0.0,
+        'think_nce': 0.0,
+        'target_step_count': 0.0,
+    }
+
+    # 温度退火（按本样本内部总步估算）
+    initial_temperature = config.INITIAL_TEMPERATURE
+    temperature_decay = config.TEMPERATURE_DECAY
+
+    # 思考-说话阶段边界
+    min_t = getattr(config, 'MIN_THINKING_STEPS', 0) or 0
+    max_t = getattr(config, 'MAX_THINKING_STEPS', 0) or 0
+    safety_t = getattr(config, 'SAFETY_MAX_THINKING_STEPS', 0) or 0
+    min_t = max(0, int(min_t))
+    max_t = max(min_t, int(max_t)) if max_t else min_t
+    safety_t = max(max_t, int(safety_t)) if safety_t else max_t
+
+    burst_seq_w = float(getattr(config, 'BURST_SEQ_LOSS_WEIGHT', 0.0) or 0.0)
+    gate_target = float(getattr(config, 'BURST_GATE_TARGET', 0.85) or 0.85)
+
+    # 梯度累积（以样本为单位更自然）
+    acc_steps = 1
+    optimizer.zero_grad()
+    # 详细收集（仅记录第一个样本，避免日志过大）
+    collect_detail = bool(getattr(config, 'COLLECT_DETAIL_FOR_DEBUG', True))
+    detail_trace = [] if collect_detail else None
+
+    # 逐样本处理（建议 BURST_BATCH_SIZE=1）
+    for b in range(batch_size):
+        # 每个样本维护自身隐藏态
+        h_prev = torch.zeros(1, config.DYNAMIC_GROUP_HIDDEN_DIM, device=DEVICE)
+
+        # 遍历该样本的有效 (prev -> target) 对（来自 steps_data 中 target 非空的步）
+        for t_idx, (x_t_pad, target_pad, _gate_lbl) in enumerate(steps_data):
+            # 取该样本的 prev 与 target（若缺失则跳过）
+            prev_tokens = None
+            if x_t_pad is not None and x_t_pad.size(0) > b and x_t_pad.size(1) > 0:
+                prev_tokens = x_t_pad[b]
+            target_tokens = None
+            if target_pad is not None and target_pad.size(0) > b and target_pad.size(1) > 0:
+                target_tokens = target_pad[b]
+            if target_tokens is None:
+                continue
+
+            # 去除全 PAD 的 target
+            if (target_tokens != config.PAD_token).sum().item() == 0:
+                continue
+
+            # 将 prev 作为 x_ref
+            if prev_tokens is None or prev_tokens.numel() == 0:
+                # 兜底：若 prev 缺失，使用 x_ref_padded[b]
+                prev_tokens = x_ref_padded[b]
+            prev_valid = prev_tokens[prev_tokens != config.PAD_token]
+            if prev_valid.numel() == 0:
+                prev_valid = torch.tensor([config.SOS_token, config.EOS_token], device=DEVICE, dtype=torch.long)
+            prev_tokens = prev_valid.unsqueeze(0).to(DEVICE)
+
+            # 1) 思考期：不输出，仅推进隐藏态（长度控制在 [min_t, max_t]，可按需要使用 max_t）
+            denom = max(max_t + float(getattr(config, 'GATE_TIME_RAMP_EXTRA_STEPS', 0) or 0), 1.0)
+            for t_inner in range(max_t):
+                current_temperature = max(initial_temperature * (temperature_decay ** (t_inner)), config.MIN_TEMPERATURE)
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    t_norm = torch.tensor([[min((t_inner + 1) / denom, 1.0)]], device=DEVICE)
+                    remain_norm = torch.tensor([[max(denom - (t_inner + 1), 0) / denom]], device=DEVICE)
+                    min_done = torch.tensor([[1.0 if (t_inner + 1) >= min_t else 0.0]], device=DEVICE)
+                    budget = torch.tensor([[gate_target]], device=DEVICE)
+                    control = torch.cat([t_norm, remain_norm, min_done, budget], dim=1)
+
+                    h_next, gate_pred, output_logits = model(
+                        x_t=None,
+                        x_ref=prev_tokens,
+                        h_prev=h_prev,
+                        temperature=current_temperature,
+                        control=control,
+                    )
+
+                    # 门控统计（仅监控）
+                    gp = torch.sigmoid(torch.nan_to_num(gate_pred, nan=0.0))
+                    gate_mean_acc += float(gp.mean().item())
+                    p = torch.clamp(gp, 1e-6, 1 - 1e-6)
+                    gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
+                    gate_obs += 1
+
+                    # 轻量思考自监督（InfoNCE）
+                    step_loss, comps = compute_loss(
+                        gate_pred=None, gate_target=None,
+                        output_logits=None, target_padded=None,
+                        h_prev=h_prev, h_next=h_next,
+                        think_loss_weight=getattr(config, 'THINK_LOSS_WEIGHT', 0.0),
+                        info_nce_tau=getattr(config, 'THINK_INFO_TAU', 0.1),
+                        return_components=True,
+                    )
+                if not (torch.isnan(step_loss) or torch.isinf(step_loss)):
+                    scaler.scale(step_loss / acc_steps).backward()
+                    total_batch_loss += step_loss.item()
+                    steps_updated += 1
+                    comps_acc['think_nce'] += comps.get('think_nce', 0.0)
+                h_prev = h_next.detach()
+                # 记录思考步明细
+                if collect_detail and b == 0 and t_idx == 0 and detail_trace is not None:
+                    try:
+                        rec = {
+                            't': f'think_{t_inner+1}',
+                            'x_t_ids': None,
+                            'target_shape': None,
+                            'gate_prob_mean': float(torch.sigmoid(torch.nan_to_num(gate_pred, nan=0.0)).mean().item()),
+                            'temperature': float(current_temperature),
+                            'loss': float(step_loss.detach().item()) if hasattr(step_loss, 'item') else float(step_loss),
+                            'comps': comps,
+                            'is_speak_step': False,
+                        }
+                        detail_trace.append(rec)
+                    except Exception:
+                        pass
+
+            # 2) 连续输出期：逐 token 自回归（teacher-forcing：gold 前缀喂回）
+            # 暂时关闭序列级输出，取静态头的单步 logits
+            use_seq_flag = getattr(model, 'use_sequence_ce', False)
+            if use_seq_flag:
+                model.use_sequence_ce = False
+
+            # 目标 token 序列（去 PAD 并移动到设备）
+            tgt_valid = target_tokens[target_tokens != config.PAD_token]
+            tgt_valid = tgt_valid.to(DEVICE, non_blocking=True)
+            # 逐 token：第 j 步输入 gold 的前缀 0..j-1，预测第 j 个 token
+            for j in range(tgt_valid.size(0)):
+                gold_tok = tgt_valid[j:j+1]  # (1,)
+                # gold 前缀
+                if j == 0:
+                    x_t_cur = None
+                else:
+                    x_t_cur = tgt_valid[:j].unsqueeze(0)  # (1, j)
+
+                current_temperature = max(initial_temperature * (temperature_decay ** (max_t + j)), config.MIN_TEMPERATURE)
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    # 说话期控制：t_norm≈1，min_done=1，鼓励 gate 高，但不做硬约束
+                    control = torch.tensor([[1.0, 0.0, 1.0, gate_target]], device=DEVICE)
+                    h_next, gate_pred, output_logits = model(
+                        x_t=x_t_cur,
+                        x_ref=prev_tokens,
+                        h_prev=h_prev,
+                        temperature=current_temperature,
+                        control=control,
+                    )
+
+                    # 单 token CE（target 为 gold_tok）
+                    step_loss, comps = compute_loss(
+                        gate_pred=gate_pred, gate_target=None,
+                        output_logits=output_logits, target_padded=gold_tok,  # 1D label
+                        gate_entropy_weight=getattr(config, 'GATE_ENTROPY_WEIGHT', 0.0),
+                        target_speak_ratio=None,
+                        return_components=True,
+                    )
+
+                # 门控统计
+                try:
+                    gp = torch.sigmoid(torch.nan_to_num(gate_pred, nan=0.0))
+                    gate_mean_acc += float(gp.mean().item())
+                    p = torch.clamp(gp, 1e-6, 1 - 1e-6)
+                    gate_entropy_acc += float(-(p * p.log() + (1 - p) * (1 - p).log()).mean().item())
+                    gate_obs += 1
+                except Exception:
+                    pass
+
+                if torch.isnan(step_loss) or torch.isinf(step_loss):
+                    step_loss = torch.zeros((), device=DEVICE)
+                else:
+                    scaler.scale(step_loss / acc_steps).backward()
+                    total_batch_loss += step_loss.item()
+                    steps_updated += 1
+                    comps_acc['token_ce'] += comps.get('token_ce', 0.0)
+                # 记录说话步明细
+                if collect_detail and b == 0 and t_idx == 0 and detail_trace is not None:
+                    try:
+                        probs = torch.softmax(output_logits.detach(), dim=-1)
+                        pred_id = int(torch.argmax(probs, dim=-1).item())
+                        k = min(5, probs.size(-1))
+                        topk_vals, topk_idx = torch.topk(probs, k=k, dim=-1)
+                        topk_pairs = list(zip([int(i) for i in topk_idx.view(-1).tolist()], [float(v) for v in topk_vals.view(-1).tolist()]))
+                        rec = {
+                            't': f'speak_{j+1}',
+                            'x_t_ids': [int(i) for i in (tgt_valid[:j].detach().cpu().tolist())] if j > 0 else [],
+                            'target_shape': (1,),
+                            'gate_prob_mean': float(torch.sigmoid(torch.nan_to_num(gate_pred, nan=0.0)).mean().item()),
+                            'temperature': float(current_temperature),
+                            'loss': float(step_loss.detach().item()) if hasattr(step_loss, 'item') else float(step_loss),
+                            'comps': comps,
+                            'pred_token': pred_id,
+                            'topk': topk_pairs,
+                            'is_speak_step': True,
+                        }
+                        detail_trace.append(rec)
+                    except Exception:
+                        pass
+
+                h_prev = h_next.detach()
+
+            # 恢复 use_sequence_ce 标志
+            if use_seq_flag:
+                model.use_sequence_ce = True
+
+            # 3) 句子级 CE（Teacher-Forcing）
+            if burst_seq_w > 0 and hasattr(model, 'seq_decoder') and hasattr(model, 'seq_out'):
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    # 用“思考期结束后的状态”作为初态（更贴近你的意图）
+                    dec_inp = model.embed(tgt_valid.unsqueeze(0))  # (1, L, E)
+                    dec_h0 = h_prev.unsqueeze(0)  # (1, 1, H)
+                    dec_out, _ = model.seq_decoder(dec_inp, dec_h0)
+                    seq_logits = model.seq_out(dec_out)  # (1, L, V)
+                    # 计算序列 CE（忽略 PAD；此处无 PAD）
+                    from .utils import compute_loss as _cl
+                    loss_seq, comps = _cl(
+                        gate_pred=None, gate_target=None, output_logits=seq_logits, target_padded=tgt_valid.unsqueeze(0),
+                        gate_entropy_weight=0.0, target_speak_ratio=None, return_components=True,
+                    )
+                if not (torch.isnan(loss_seq) or torch.isinf(loss_seq)):
+                    scaler.scale((burst_seq_w * loss_seq) / acc_steps).backward()
+                    total_batch_loss += float((burst_seq_w * loss_seq).detach().item())
+                    steps_updated += 1
+
+        # 样本结束
+
+    # 单 batch 的优化步
+    try:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    except Exception as _e:
+        print(f"[WARNING] optimizer.step/update failed (burst_ar): {_e}; performing gradient reset")
+    optimizer.zero_grad()
+
+    gate_mean = (gate_mean_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
+    gate_entropy = (gate_entropy_acc / max(1, gate_obs)) if gate_obs > 0 else 0.0
+    comps_avg = {k: (v / max(1, steps_updated)) for k, v in comps_acc.items()}
+
+    return total_batch_loss, steps_updated, gate_mean, gate_entropy, int(ended_by_cap), comps_avg, detail_trace
+
 # 剪枝/再生长：按配置周期触发（最小实现，模块级函数）
 def maybe_prune_regrow(model, total_steps):
     try:
@@ -1247,6 +1513,13 @@ def train_model():
 
         train_data_dir = os.path.join(config.LCCC_PROCESSED_PATH, "train")
 
+        # 若开启 burst_ar 训练模式，调整 batch 大小
+        if str(getattr(config, 'TRAIN_MODE', 'stepwise')).lower() == 'burst_ar':
+            try:
+                config.BATCH_SIZE = int(getattr(config, 'BURST_BATCH_SIZE', 1) or 1)
+            except Exception:
+                config.BATCH_SIZE = 1
+
         best_val_loss = float('inf')
 
         # 学习率调度器（优化2）：step/plateau 按配置选择
@@ -1368,9 +1641,14 @@ def train_model():
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
-                                x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
-                            )
+                            if str(getattr(config, 'TRAIN_MODE', 'stepwise')).lower() == 'burst_ar':
+                                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_burst_ar(
+                                    x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                                )
+                            else:
+                                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
+                                    x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                                )
                             total_steps += steps_in_batch
                             avg_loss = batch_loss / max(1, steps_in_batch)
                             pbar.set_postfix({
@@ -1414,7 +1692,9 @@ def train_model():
                                         lines.append(f"dialogue_tokens[0]={' '.join(toks)}")
                                         lines.append(f"embed_shape_for_sample0={emb_shape}")
                                         lines.append(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
-                                        for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                        _cap = int(getattr(config, 'DETAIL_MAX_RECORDS', 64) or 64)
+                                        _seq = (detail_trace or []) if (_cap <= 0) else (detail_trace or [])[:min(_cap, len(detail_trace or []))]
+                                        for rec in _seq:
                                             xt = rec.get('x_t_ids')
                                             xt_dec = ''
                                             try:
@@ -1438,6 +1718,16 @@ def train_model():
                                                 pass
                                             lines.append(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
                                         lines.append("===== [END DETAIL] =====")
+                                        # 可选：落盘完整 JSON（包含全部记录，不受 DETAIL_MAX_RECORDS 限制）
+                                        try:
+                                            if getattr(config, 'DETAIL_DUMP_JSON', False) and (detail_trace is not None):
+                                                import json as _json
+                                                os.makedirs('logs', exist_ok=True)
+                                                _dump_path = os.path.join('logs', f'detail_trace_{chunk_name}_{total_steps}.json')
+                                                with open(_dump_path, 'w', encoding='utf-8') as _f:
+                                                    _json.dump(detail_trace, _f, ensure_ascii=False)
+                                        except Exception:
+                                            pass
                                         _emit_detail_report(lines, train_model._files_counter, total_steps, avg_loss, chunk_name)
                                         # 推进下一阈值
                                         train_model._detail_next_at += int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
@@ -1510,9 +1800,14 @@ def train_model():
                         )
                         pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS} | {chunk_name}")
                         for x_ref_padded, steps_data in pbar:
-                            batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
-                                x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
-                            )
+                            if str(getattr(config, 'TRAIN_MODE', 'stepwise')).lower() == 'burst_ar':
+                                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_burst_ar(
+                                    x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                                )
+                            else:
+                                batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
+                                    x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                                )
                             total_steps += steps_in_batch
                             avg_loss = batch_loss / max(1, steps_in_batch)
                             pbar.set_postfix({
@@ -1553,7 +1848,9 @@ def train_model():
                                         print(f"dialogue_tokens[0]={' '.join(toks)}")
                                         print(f"embed_shape_for_sample0={emb_shape}")
                                         print(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
-                                        for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                        _cap = int(getattr(config, 'DETAIL_MAX_RECORDS', 64) or 64)
+                                        _seq = (detail_trace or []) if (_cap <= 0) else (detail_trace or [])[:min(_cap, len(detail_trace or []))]
+                                        for rec in _seq:
                                             xt = rec.get('x_t_ids')
                                             xt_dec = ''
                                             try:
@@ -1577,6 +1874,15 @@ def train_model():
                                                 pass
                                             print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
                                         print("===== [END DETAIL] =====\n")
+                                        try:
+                                            if getattr(config, 'DETAIL_DUMP_JSON', False) and (detail_trace is not None):
+                                                import json as _json
+                                                os.makedirs('logs', exist_ok=True)
+                                                _dump_path = os.path.join('logs', f'detail_trace_{chunk_name}_{total_steps}.json')
+                                                with open(_dump_path, 'w', encoding='utf-8') as _f:
+                                                    _json.dump(detail_trace, _f, ensure_ascii=False)
+                                        except Exception:
+                                            pass
                                         train_model._detail_next_at += int(getattr(config, 'PRINT_DETAIL_EVERY_N_STEPS', 0) or 0)
                             except Exception:
                                 pass
@@ -1637,9 +1943,14 @@ def train_model():
                 )
                 pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{config.NUM_EPOCHS}")
                 for x_ref_padded, steps_data in pbar:
-                    batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
-                        x_ref_padded, steps_data, model, optimizer, scaler
-                    )
+                    if str(getattr(config, 'TRAIN_MODE', 'stepwise')).lower() == 'burst_ar':
+                        batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_burst_ar(
+                            x_ref_padded, steps_data, model, optimizer, scaler, global_total_steps=total_steps
+                        )
+                    else:
+                        batch_loss, steps_in_batch, gate_mean, gate_entropy, cap_hit, comps_avg, detail_trace = train_batch_stepwise(
+                            x_ref_padded, steps_data, model, optimizer, scaler
+                        )
                     total_steps += steps_in_batch
                     avg_loss = batch_loss / steps_in_batch if steps_in_batch > 0 else 0
                     pbar.set_postfix({
@@ -1692,7 +2003,9 @@ def train_model():
                                 print(f"dialogue_tokens[0]={' '.join(toks)}")
                                 print(f"embed_shape_for_sample0={emb_shape}")
                                 print(f"lr={optimizer.param_groups[0]['lr']:.6f} acc_steps={int(getattr(config, 'GRADIENT_ACCUMULATION_STEPS', 1) or 1)} temp0={getattr(config, 'INITIAL_TEMPERATURE', 1.0)} decay={getattr(config, 'TEMPERATURE_DECAY', 0.95)}")
-                                for rec in (detail_trace or [])[:min(64, len(detail_trace or []))]:
+                                _cap = int(getattr(config, 'DETAIL_MAX_RECORDS', 64) or 64)
+                                _seq = (detail_trace or []) if (_cap <= 0) else (detail_trace or [])[:min(_cap, len(detail_trace or []))]
+                                for rec in _seq:
                                     xt = rec.get('x_t_ids')
                                     xt_dec = ''
                                     try:
@@ -1716,6 +2029,15 @@ def train_model():
                                         pass
                                     print(f"t={rec.get('t')} speak={rec.get('is_speak_step')} temp={rec.get('temperature'):.3f} gate_p={rec.get('gate_prob_mean'):.4f} loss={rec.get('loss'):.6f} pred='{pred_tok}' top5=[{topk_fmt}] x_t='{xt_dec}' comps={rec.get('comps')}")
                                 print("===== [END DETAIL] =====\n")
+                                try:
+                                    if getattr(config, 'DETAIL_DUMP_JSON', False) and (detail_trace is not None):
+                                        import json as _json
+                                        os.makedirs('logs', exist_ok=True)
+                                        _dump_path = os.path.join('logs', f'detail_trace_{total_steps}.json')
+                                        with open(_dump_path, 'w', encoding='utf-8') as _f:
+                                            _json.dump(detail_trace, _f, ensure_ascii=False)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     if total_steps > 0 and total_steps % config.SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
