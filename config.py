@@ -241,7 +241,7 @@ DEBUG_TOKEN_CE = False
 DEBUG_TOKEN_CE_EVERY_N = 1000  # 每训练多少“对话样本”打印一次调试摘要（而非按内部步）。设为0关闭。
 
 # 语言 CE 的 label smoothing 系数（0 表示关闭）；建议 0.05 起步
-LABEL_SMOOTHING = 0.0
+LABEL_SMOOTHING = 0.05
 
 # THINK_LOSS warmup 步数（0 表示关闭）。建议设为若干验证间隔的总步数，如 5*VALIDATE_EVERY_N_STEPS
 # 注意：需在 VALIDATE_EVERY_N_STEPS 定义之后设置；此处仅占位，真正值在下方定义
@@ -286,7 +286,7 @@ TEST_NUM_WORKERS = STREAM_DATALOADER_NUM_WORKERS
 #   - 越高越保守：更倾向多思考几步再说；越低越激进：更快开始说话。
 #   - 与 MIN/MAX_THINKING_STEPS 配合：达到 MAX_THINKING_STEPS 即使 gate 低也会强制说话（cap 行为）。
 #   - 典型范围：0.5–0.9。建议从 0.7–0.85 区间微调，观测 gate_mean、gate_entropy 与 cap 触发率。
-GATE_THRESHOLD = 0.80
+GATE_THRESHOLD = 0.5
 
 # 动态早停阈值的时间偏移：阈值随 t 增长略降，靠近 MAX 更易触发（0 关闭）
 GATE_DYNAMIC_THRESHOLD_EPS = 0.05
@@ -306,9 +306,9 @@ USE_CONTEXTUAL_SAMPLER = True
 
 # 门控正则与思考损失（可选）
 # 目标发声比例（用于预算正则，不是硬约束）
-TARGET_SPEAK_RATIO = 0.2
+TARGET_SPEAK_RATIO = 0.15
 # 门控熵正则权重（鼓励适度不确定性，防止塌缩）
-GATE_ENTROPY_WEIGHT = 1e-3
+GATE_ENTROPY_WEIGHT = 8e-4
 # 门控BCE的正样本权重（处理类别不均衡：思考步多gate=0，发声步少gate=1）
 GATE_POS_WEIGHT = 1.2
 # 思考信息量损失（InfoNCE 等）的权重（0 表示关闭）
@@ -322,17 +322,17 @@ PRINT_DETAIL_EVERY_N_STEPS = 500
 # 思考过程Top-K追踪：每N步记录一次第一个样本的Top-K输出到 logs/thinking_trace.txt（0表示关闭）
 THINK_TRACE_EVERY_N_STEPS = 1000
 # 思考步弱监督 token_ce（让每步输出更贴近最终答案；小权重+warmup更稳）
-THINK_STEP_CE_WEIGHT = 0.0
-THINK_STEP_CE_WARMUP_STEPS = 0
-# 加权方案："t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
+THINK_STEP_CE_WEIGHT = 0.3
+THINK_STEP_CE_WARMUP_STEPS = 5000
+# 加权方案:"t_norm"（步内靠后加权更大）或 "gate_prob"（按门控概率加权）
 THINK_STEP_CE_SCHEME = "t_norm"
 
 # 思考步蒸馏（弱反馈）：将思考步分布轻量拉向发声/序列解码器的软目标
 # 0 表示关闭
-THOUGHT_DISTILL_WEIGHT = 0.3
-THOUGHT_DISTILL_WARMUP_STEPS = 0
+THOUGHT_DISTILL_WEIGHT = 0.6
+THOUGHT_DISTILL_WARMUP_STEPS = 1000
 THOUGHT_DISTILL_SCHEME = "t_norm"   # 't_norm' 或 'gate_prob'
-THOUGHT_DISTILL_TAU = 1.0            # 蒸馏温度
+THOUGHT_DISTILL_TAU = 2.0            # 蒸馏温度
 
 # 动态反馈（将阈值与上一步门控/输出摘要喂回动态组，t+1步使用）
 USE_DYNAMIC_FEEDBACK = True
@@ -371,15 +371,15 @@ USE_SEQUENCE_CE = True
 # ------------------------------------
 # 剪枝与再生长（动态稀疏）设置
 # ------------------------------------
-PRUNE_ENABLE = False           # 开关：是否启用训练中剪枝
+PRUNE_ENABLE = True           # 开关：是否启用训练中剪枝
 USAGE_EMA_BETA = 0.9          # 使用频度的EMA系数（与 HEBB_EMA_BETA 可一致）
 
-PRUNE_START_STEPS = 2000       # 从第多少个总更新步开始剪枝（暖身）
-PRUNE_EVERY_STEPS = 1000       # 每多少个总更新步进行一次剪枝
+PRUNE_START_STEPS = 1000       # 从第多少个总更新步开始剪枝（暖身）
+PRUNE_EVERY_STEPS = 500       # 每多少个总更新步进行一次剪枝
 PRUNE_SPARSE_STEP = 0.05       # 每次新增剪枝比例（相对于当前激活连接的比例）
 PRUNE_MIN_KEEP = 4             # 每行（每个输出神经元）至少保留的连接数
 
-REGROW_ENABLE = False          # 开关：是否在剪枝后再生长
+REGROW_ENABLE = True          # 开关：是否在剪枝后再生长
 REGROW_PER_ROW = 1             # 每行再生长的连接数
 REGROW_INIT_STD = 1e-3         # 新生连接权重初始化标准差
 

@@ -280,9 +280,11 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
             if (not decided_to_speak) and (max_t is not None) and ((t + 1) == max_t):
                 decided_to_speak = True
 
-            # 若无 target 且决定发声，使用最终目标监督；并将 gate_target 置为 1
-            y_for_loss = target_padded
-            if y_for_loss is None and decided_to_speak and final_target_padded is not None:
+            # 仅在“决定发声”或安全步时施加 CE；避免在思考步对输出头施加强监督
+            y_for_loss = None
+            if decided_to_speak:
+                y_for_loss = target_padded if target_padded is not None else final_target_padded
+            elif is_safety_step and final_target_padded is not None:
                 y_for_loss = final_target_padded
             step_loss, comps = compute_loss(
                 gate_pred, None, output_logits, y_for_loss,
@@ -495,18 +497,30 @@ def train_batch_stepwise(x_ref_padded, steps_data, model, optimizer, scaler, glo
                         weight_scalar = float(torch.sigmoid(gate_pred.detach()).mean().item())
                     else:
                         weight_scalar = 1.0
-                    # 仅取 CE 分项并加到总损失
+                    # 仅取 CE 分项并加到总损失（忽略 EOS：将 EOS 位置改为 PAD，避免把分布强推向 EOS）
                     from .utils import compute_loss as _cl
-                    aux_loss, aux_comps = _cl(
-                        gate_pred=None, gate_target=None,
-                        output_logits=output_logits, target_padded=final_target_padded,
-                        gate_entropy_weight=0.0, target_speak_ratio=None,
-                        return_components=True,
-                    )
-                    token_ce_aux = aux_comps.get('token_ce', 0.0) if isinstance(aux_comps, dict) else 0.0
-                    add_val = w_eff * weight_scalar * token_ce_aux
-                    step_loss = step_loss + (w_eff * weight_scalar * (aux_loss if aux_loss is not None else 0.0))
-                    comps_acc['token_ce'] = comps_acc.get('token_ce', 0.0) + add_val
+                    try:
+                        masked_target = final_target_padded
+                        if masked_target is not None and masked_target.dim() == 2:
+                            masked_target = masked_target.clone()
+                            masked_target[masked_target == getattr(config, 'EOS_token', 2)] = getattr(config, 'PAD_token', 0)
+                            # 若整行均为 PAD，则跳过该步 CE
+                            nonpad_any = (masked_target != getattr(config, 'PAD_token', 0)).any(dim=1)
+                            if not bool(nonpad_any.any().item()):
+                                masked_target = None
+                        if masked_target is not None:
+                            aux_loss, aux_comps = _cl(
+                                gate_pred=None, gate_target=None,
+                                output_logits=output_logits, target_padded=masked_target,
+                                gate_entropy_weight=0.0, target_speak_ratio=None,
+                                return_components=True,
+                            )
+                            token_ce_aux = aux_comps.get('token_ce', 0.0) if isinstance(aux_comps, dict) else 0.0
+                            add_val = w_eff * weight_scalar * token_ce_aux
+                            step_loss = step_loss + (w_eff * weight_scalar * (aux_loss if aux_loss is not None else 0.0))
+                            comps_acc['token_ce'] = comps_acc.get('token_ce', 0.0) + add_val
+                    except Exception:
+                        pass
                     # 调试输出：辅助 token_ce 是否被触发及其数值
                     if getattr(config, 'DEBUG_TOKEN_CE', False):
                         try:
